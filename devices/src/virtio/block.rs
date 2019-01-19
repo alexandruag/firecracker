@@ -5,7 +5,6 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
-use epoll;
 use std::cmp;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -15,6 +14,9 @@ use std::result;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
+
+use epoll;
+use libc;
 
 use super::super::Error as DeviceError;
 use super::{
@@ -45,6 +47,52 @@ pub const FS_UPDATE_EVENT: DeviceEventT = 2;
 // Number of DeviceEventT events supported by this implementation.
 pub const BLOCK_EVENTS_COUNT: usize = 3;
 
+// TODO: Think about the following:
+// - Using mmap theoretically opens Firecracker up to receiving SIGSEGVs and SIGBUSes. Should
+//   we do anything special, or just embrace the possibility of abruptly crashing?
+// - Should we explicitly msync() every now and then for RW files?
+struct MmapedFile<'a> {
+    slice: &'a mut [u8],
+}
+
+use std::ptr;
+use std::slice;
+
+impl<'a> MmapedFile<'a> {
+    fn new(f: &File) -> Self {
+        let len = f.metadata().unwrap().len() as usize;
+        // Safe because the parameters are valid, and we check the result.
+        let addr = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                f.as_raw_fd(),
+                0,
+            )
+        };
+
+        if addr.is_null() {
+            panic!("addr is null");
+        }
+
+        // Well, this is not actually safe, because someone can (for example) truncate the file,
+        // but we'll get a signal then so it's somewhat fine.
+        let slice = unsafe { slice::from_raw_parts_mut::<'a>(addr as *mut u8, len) };
+
+        MmapedFile { slice }
+    }
+
+    fn slice_from(&self, offset: usize) -> &[u8] {
+        &self.slice[offset..]
+    }
+
+    fn slice_mut_from(&mut self, offset: usize) -> &mut [u8] {
+        &mut self.slice[offset..]
+    }
+}
+
 #[derive(Debug)]
 enum Error {
     /// Guest gave us bad memory addresses.
@@ -67,7 +115,6 @@ enum Error {
 enum ExecuteError {
     Flush(io::Error),
     Read(GuestMemoryError),
-    Seek(io::Error),
     Write(GuestMemoryError),
     Unsupported(u32),
 }
@@ -77,7 +124,6 @@ impl ExecuteError {
         match self {
             &ExecuteError::Flush(_) => VIRTIO_BLK_S_IOERR,
             &ExecuteError::Read(_) => VIRTIO_BLK_S_IOERR,
-            &ExecuteError::Seek(_) => VIRTIO_BLK_S_IOERR,
             &ExecuteError::Write(_) => VIRTIO_BLK_S_IOERR,
             &ExecuteError::Unsupported(_) => VIRTIO_BLK_S_UNSUPP,
         }
@@ -204,21 +250,29 @@ impl Request {
     fn execute<T: Seek + Read + Write>(
         &self,
         disk: &mut T,
+        mm: &mut MmapedFile,
         mem: &GuestMemory,
         disk_id: &Vec<u8>,
     ) -> result::Result<u32, ExecuteError> {
-        disk.seek(SeekFrom::Start(self.sector << SECTOR_SHIFT))
-            .map_err(ExecuteError::Seek)?;
+        let offset = (self.sector as usize) << SECTOR_SHIFT;
         match self.request_type {
             RequestType::In => {
-                mem.read_to_memory(self.data_addr, disk, self.data_len as usize)
-                    .map_err(ExecuteError::Read)?;
+                mem.read_to_memory(
+                    self.data_addr,
+                    &mut mm.slice_from(offset),
+                    self.data_len as usize,
+                )
+                .map_err(ExecuteError::Read)?;
                 METRICS.block.read_count.add(self.data_len as usize);
                 return Ok(self.data_len);
             }
             RequestType::Out => {
-                mem.write_from_memory(self.data_addr, disk, self.data_len as usize)
-                    .map_err(ExecuteError::Write)?;
+                mem.write_from_memory(
+                    self.data_addr,
+                    &mut mm.slice_mut_from(offset),
+                    self.data_len as usize,
+                )
+                .map_err(ExecuteError::Write)?;
                 METRICS.block.write_count.add(self.data_len as usize);
             }
             RequestType::Flush => match disk.flush() {
@@ -242,6 +296,7 @@ struct BlockEpollHandler {
     queues: Vec<Queue>,
     mem: GuestMemory,
     disk_image: File,
+    mm: MmapedFile<'static>,
     interrupt_status: Arc<AtomicUsize>,
     interrupt_evt: EventFd,
     queue_evt: EventFd,
@@ -284,20 +339,23 @@ impl BlockEpollHandler {
                             break;
                         }
                     }
-                    let status =
-                        match request.execute(&mut self.disk_image, &self.mem, &self.disk_image_id)
-                        {
-                            Ok(l) => {
-                                len = l;
-                                VIRTIO_BLK_S_OK
-                            }
-                            Err(e) => {
-                                error!("Failed to execute request: {:?}", e);
-                                METRICS.block.invalid_reqs_count.inc();
-                                len = 1; // We need at least 1 byte for the status.
-                                e.status()
-                            }
-                        };
+                    let status = match request.execute(
+                        &mut self.disk_image,
+                        &mut self.mm,
+                        &self.mem,
+                        &self.disk_image_id,
+                    ) {
+                        Ok(l) => {
+                            len = l;
+                            VIRTIO_BLK_S_OK
+                        }
+                        Err(e) => {
+                            error!("Failed to execute request: {:?}", e);
+                            METRICS.block.invalid_reqs_count.inc();
+                            len = 1; // We need at least 1 byte for the status.
+                            e.status()
+                        }
+                    };
                     // We use unwrap because the request parsing process already checked that the
                     // status_addr was valid.
                     self.mem
@@ -417,6 +475,7 @@ impl EpollConfig {
 /// Virtio device for exposing block level read/write operations on a host file.
 pub struct Block {
     disk_image: Option<File>,
+    mm: Option<MmapedFile<'static>>,
     avail_features: u64,
     acked_features: u64,
     config_space: Vec<u8>,
@@ -461,8 +520,11 @@ impl Block {
             avail_features |= 1 << VIRTIO_BLK_F_RO;
         };
 
+        let mm = Some(MmapedFile::new(&disk_image));
+
         Ok(Block {
             disk_image: Some(disk_image),
+            mm,
             avail_features,
             acked_features: 0u64,
             config_space: build_config_space(disk_size),
@@ -568,6 +630,7 @@ impl VirtioDevice for Block {
                 queues,
                 mem,
                 disk_image,
+                mm: self.mm.take().unwrap(),
                 interrupt_status: status,
                 interrupt_evt,
                 queue_evt,
