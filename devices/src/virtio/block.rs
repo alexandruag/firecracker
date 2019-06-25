@@ -231,7 +231,7 @@ impl Request {
         disk_nsectors: u64,
         mem: &GuestMemory,
         disk_id: &Vec<u8>,
-        encryption_context: &mut Option<EncryptionContext>,
+        encryption_context: Option<&mut EncryptionContext>,
     ) -> result::Result<u32, ExecuteError> {
         let mut top: u64 = u64::from(self.data_len) / SECTOR_SIZE;
         if u64::from(self.data_len) % SECTOR_SIZE != 0 {
@@ -317,7 +317,7 @@ struct BlockEpollHandler {
     queue_evt: EventFd,
     rate_limiter: RateLimiter,
     disk_image_id: Vec<u8>,
-    encryption_description: Option<EncryptionDescription>,
+    encryption_context: Option<EncryptionContext>,
 }
 
 impl BlockEpollHandler {
@@ -355,17 +355,13 @@ impl BlockEpollHandler {
                             break;
                         }
                     }
-                    let mut encryption_context: Option<EncryptionContext> =
-                        match &self.encryption_description {
-                            Some(encr) => Some(EncryptionContext::new(encr)),
-                            None => None,
-                        };
+
                     let status = match request.execute(
                         &mut self.disk_image,
                         self.disk_nsectors,
                         &self.mem,
                         &self.disk_image_id,
-                        &mut encryption_context,
+                        self.encryption_context.as_mut(),
                     ) {
                         Ok(l) => {
                             len = l;
@@ -508,7 +504,7 @@ pub struct Block {
     config_space: Vec<u8>,
     epoll_config: EpollConfig,
     rate_limiter: Option<RateLimiter>,
-    encryption_description: Option<EncryptionDescription>,
+    encryption_context: Option<EncryptionContext>,
 }
 
 pub fn build_config_space(disk_size: u64) -> Vec<u8> {
@@ -532,7 +528,7 @@ impl Block {
         is_disk_read_only: bool,
         epoll_config: EpollConfig,
         rate_limiter: Option<RateLimiter>,
-        encryption_description: Option<EncryptionDescription>,
+        encryption_context: Option<EncryptionContext>,
     ) -> io::Result<Block> {
         let disk_size = disk_image.seek(SeekFrom::End(0))? as u64;
         if disk_size % SECTOR_SIZE != 0 {
@@ -557,7 +553,7 @@ impl Block {
             config_space: build_config_space(disk_size),
             epoll_config,
             rate_limiter,
-            encryption_description,
+            encryption_context,
         })
     }
 }
@@ -664,7 +660,7 @@ impl VirtioDevice for Block {
                 queue_evt,
                 rate_limiter: self.rate_limiter.take().unwrap_or_default(),
                 disk_image_id,
-                encryption_description: self.encryption_description.take(),
+                encryption_context: self.encryption_context.take(),
             };
             let rate_limiter_rawfd = handler.rate_limiter.as_raw_fd();
 

@@ -7,9 +7,6 @@ use openssl::symm::{encrypt, Cipher};
 use std::env;
 use std::fs::{File, OpenOptions};
 use std::io::{prelude::*, Result};
-use std::mem::transmute;
-
-use encryption::transform_u128_to_array_of_u8;
 
 pub const SECTOR_SIZE: usize = 512;
 
@@ -35,7 +32,7 @@ fn main() -> Result<()> {
     let no_sectors = buffer.len() / SECTOR_SIZE;
 
     for no_sector in 0..no_sectors {
-        let iv: [u8; 16] = transform_u128_to_array_of_u8(no_sector as u128);
+        let iv: [u8; 16] = (no_sector as u128).to_le_bytes();
         buffer_encr = encrypt(
             cipher,
             &key,

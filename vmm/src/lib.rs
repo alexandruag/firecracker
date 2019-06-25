@@ -68,6 +68,7 @@ use device_manager::mmio::MMIODeviceManager;
 use devices::legacy::I8042DeviceError;
 use devices::virtio;
 use devices::{DeviceEventT, EpollHandler, EpollHandlerPayload};
+use encryption::EncryptionContext;
 use fc_util::now_cputime_us;
 use kernel::cmdline as kernel_cmdline;
 use kernel::loader as kernel_loader;
@@ -767,13 +768,20 @@ impl Vmm {
                 None => None,
             };
 
+            let encryption_context = if let Some(desc) = drive_config.encryption_description.take()
+            {
+                Some(EncryptionContext::new(desc))
+            } else {
+                None
+            };
+
             let block_box = Box::new(
                 devices::virtio::Block::new(
                     block_file,
                     drive_config.is_read_only,
                     epoll_config,
                     rate_limiter,
-                    drive_config.encryption_description.take(),
+                    encryption_context,
                 )
                 .map_err(StartMicrovmError::CreateBlockDevice)?,
             );

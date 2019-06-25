@@ -1,5 +1,4 @@
 extern crate libc;
-#[macro_use]
 extern crate logger;
 extern crate memory_model;
 extern crate openssl;
@@ -8,7 +7,6 @@ extern crate serde;
 extern crate serde_derive;
 
 use std::io::{self, Read, Seek, Write};
-use std::mem::transmute;
 
 use memory_model::{GuestAddress, GuestMemory, GuestMemoryError};
 use openssl::error::ErrorStack;
@@ -49,14 +47,6 @@ pub struct EncryptionDescription {
     pub key: Vec<u8>,
     ///The algorithm used for data encryption
     pub algorithm: EncryptionAlgorithm,
-}
-
-pub fn transform_u128_to_array_of_u8(num: u128) -> [u8; 16] {
-    let mut bytes: [u8; 16] = [0u8; 16];
-    for i in 0..16 {
-        bytes[i] = ((num >> (8 * (15 - i))) & 0xff) as u8;
-    }
-    return bytes;
 }
 
 pub fn parse_str<S>(s: &S) -> Result<Vec<u8>, &str>
@@ -104,9 +94,9 @@ pub struct EncryptionContext {
 }
 
 impl EncryptionContext {
-    pub fn new(encr_descr: &EncryptionDescription) -> Self {
+    pub fn new(encryption_description: EncryptionDescription) -> Self {
         EncryptionContext {
-            encryption_description: encr_descr.clone(),
+            encryption_description,
             cipher: Cipher::aes_256_xts(),
             initial_buffer: [0u8; SECTOR_SIZE],
             final_buffer: Vec::new(),
@@ -124,7 +114,7 @@ impl EncryptionContext {
         let addr = &mut GuestAddress(data_addr.offset());
         let mut bytes_count: usize = 0;
         for sector_offset in 0..num_sectors {
-            let iv: [u8; 16] = transform_u128_to_array_of_u8((no_sector + sector_offset) as u128);
+            let iv: [u8; 16] = ((no_sector + sector_offset) as u128).to_le_bytes();
             //        unsafe { transmute(((no_sector + sector_offset) as u128).to_be()) };
             let mut sector_bytes: usize = 0;
             while sector_bytes < SECTOR_SIZE {
@@ -162,7 +152,7 @@ impl EncryptionContext {
         let addr = &mut GuestAddress(data_addr.offset());
         let mut bytes_count: usize = 0;
         for sector_offset in 0..num_sectors {
-            let iv: [u8; 16] = transform_u128_to_array_of_u8((no_sector + sector_offset) as u128);
+            let iv: [u8; 16] = ((no_sector + sector_offset) as u128).to_le_bytes();
             //     unsafe { transmute(((no_sector + sector_offset) as u128).to_be()) };
             let mut sector_bytes: usize = 0;
 
