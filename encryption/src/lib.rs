@@ -109,35 +109,33 @@ impl EncryptionContext {
         data_addr: GuestAddress,
         data_len: usize,
         no_sector: u64,
-    ) -> Result<usize, EncryptionError> {
+    ) -> Result<(), EncryptionError> {
         let num_sectors = (data_len / SECTOR_SIZE) as u64;
         let addr = &mut GuestAddress(data_addr.offset());
-        let mut bytes_count: usize = 0;
         for sector_offset in 0..num_sectors {
             let iv: [u8; 16] = ((no_sector + sector_offset) as u128).to_le_bytes();
-            //        unsafe { transmute(((no_sector + sector_offset) as u128).to_be()) };
-            let mut sector_bytes: usize = 0;
-            while sector_bytes < SECTOR_SIZE {
-                let _ = match disk.read(&mut self.initial_buffer) {
-                    Ok(len) => {
-                        self.final_buffer = openssl_decrypt(
-                            self.cipher,
-                            &self.encryption_description.key,
-                            Some(&iv),
-                            &mut self.initial_buffer,
-                        )
-                        .map_err(|e| EncryptionError::OpensslError(e))?;
-                        mem.write_slice_at_addr(&self.final_buffer, *addr)
-                            .map_err(|e| EncryptionError::MemoryError(e))?;
-                        *addr = addr.checked_add(len as usize).unwrap();
-                        sector_bytes += len as usize;
-                    }
-                    Err(e) => return Err(EncryptionError::IOError(e)),
-                };
-            }
-            bytes_count += sector_bytes;
+
+            // Read_exact will fill the buffer or return an error, so we don't have to worry
+            // about dealing with partial reads.
+            disk.read_exact(&mut self.initial_buffer)
+                .map_err(EncryptionError::IOError)?;
+
+            self.final_buffer = openssl_decrypt(
+                self.cipher,
+                &self.encryption_description.key,
+                Some(&iv),
+                &mut self.initial_buffer,
+            )
+            .map_err(EncryptionError::OpensslError)?;
+
+            mem.write_slice_at_addr(&self.final_buffer, *addr)
+                .map_err(EncryptionError::MemoryError)?;
+
+            // We should check for error here at some point instead of unwrapping.
+            *addr = addr.checked_add(SECTOR_SIZE).unwrap();
         }
-        Ok(bytes_count)
+
+        Ok(())
     }
 
     pub fn encrypt<T: Seek + Read + Write>(
@@ -147,17 +145,15 @@ impl EncryptionContext {
         data_addr: GuestAddress,
         data_len: usize,
         no_sector: u64,
-    ) -> Result<usize, EncryptionError> {
+    ) -> Result<(), EncryptionError> {
         let num_sectors = (data_len / SECTOR_SIZE) as u64;
         let addr = &mut GuestAddress(data_addr.offset());
-        let mut bytes_count: usize = 0;
         for sector_offset in 0..num_sectors {
             let iv: [u8; 16] = ((no_sector + sector_offset) as u128).to_le_bytes();
-            //     unsafe { transmute(((no_sector + sector_offset) as u128).to_be()) };
-            let mut sector_bytes: usize = 0;
 
             mem.read_slice_at_addr(&mut self.initial_buffer, *addr)
-                .map_err(|e| EncryptionError::MemoryError(e))?;
+                .map_err(EncryptionError::MemoryError)?;
+
             self.final_buffer = openssl_encrypt(
                 self.cipher,
                 &self.encryption_description.key,
@@ -166,18 +162,15 @@ impl EncryptionContext {
             )
             .map_err(|e| EncryptionError::OpensslError(e))?;
 
-            while sector_bytes < SECTOR_SIZE {
-                let _ = match disk.write(&mut self.final_buffer) {
-                    Ok(len) => {
-                        sector_bytes += len as usize;
-                    }
-                    Err(e) => return Err(EncryptionError::IOError(e)),
-                };
-            }
-            *addr = addr.checked_add(sector_bytes).unwrap();
-            bytes_count += sector_bytes;
+            // Write_all attempts to write everything or returns an error, so we don't have to
+            // worry about dealing with partial writes.
+            disk.write_all(&mut self.final_buffer)
+                .map_err(EncryptionError::IOError)?;
+
+            // We should check for error here at some point instead of unwrapping.
+            *addr = addr.checked_add(SECTOR_SIZE).unwrap();
         }
-        Ok(bytes_count)
+        Ok(())
     }
 }
 
