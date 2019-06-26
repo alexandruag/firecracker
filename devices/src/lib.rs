@@ -11,6 +11,7 @@ extern crate epoll;
 extern crate libc;
 
 extern crate dumbo;
+extern crate encryption;
 #[macro_use]
 extern crate logger;
 extern crate memory_model;

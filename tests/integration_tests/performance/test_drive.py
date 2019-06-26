@@ -15,9 +15,12 @@ IO_DEPTHS = ['1', '2', '8', '32']
 IO_PATTERNS = ['randread', 'randwrite', 'read', 'write']
 
 
-@pytest.mark.timeout(0)
-def test_drive_performance(test_microvm_with_ssh, network_config):
+def _drive_performance_helper(test_microvm_with_ssh, network_config, test_encryption):
     """Test the output of fio for read / write operations on /dev/vdb"""
+
+    if test_microvm_with_ssh.build_feature == 'vsock':
+        pytest.skip('Skipping drive performance tests for vsock builds')
+
     test_microvm = test_microvm_with_ssh
     test_microvm.spawn()
 
@@ -27,11 +30,20 @@ def test_drive_performance(test_microvm_with_ssh, network_config):
     fs1 = drive_tools.FilesystemFile(
         os.path.join(test_microvm.fsfiles, 'scratch'), size=2048
     )
+
+    encryption_description = None
+    if test_encryption:
+        encryption_description = {
+            'key': '11223344556677889900112233445566778899001122334455667788990011223344556677889900112233445566778899001122334455667788990011223344',
+            'algorithm': 'AES256XTS'
+        }
+
     response = test_microvm.drive.put(
         drive_id='scratch',
         path_on_host=test_microvm.create_jailed_resource(fs1.path),
         is_root_device=False,
-        is_read_only=False
+        is_read_only=False,
+        encryption_description=encryption_description
     )
 
     assert test_microvm.api_session.is_status_no_content(response.status_code)
@@ -51,6 +63,15 @@ def test_drive_performance(test_microvm_with_ssh, network_config):
                                                                    " fio config.fio --output-format=json")
                 assert stderr.read().decode('utf-8') == ''
                 print(json.loads(stdout.read().decode('utf-8')))
+
+
+@pytest.mark.timeout(0)
+def test_drive_performance(test_microvm_with_ssh, network_config):
+    _drive_performance_helper(test_microvm_with_ssh, network_config, False)
+
+@pytest.mark.timeout(0)
+def test_encrypted_drive_performance(test_microvm_with_ssh, network_config):
+    _drive_performance_helper(test_microvm_with_ssh, network_config, True)
 
 
 # @pytest.mark.timeout(0)

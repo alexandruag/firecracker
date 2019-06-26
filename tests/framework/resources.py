@@ -146,7 +146,8 @@ class Drive:
             is_root_device=None,
             partuuid=None,
             is_read_only=None,
-            rate_limiter=None
+            rate_limiter=None,
+            encryption_description=None
     ):
         """Compose the json associated to this type of API request."""
         datax = {}
@@ -162,6 +163,8 @@ class Drive:
             datax['is_read_only'] = is_read_only
         if rate_limiter is not None:
             datax['rate_limiter'] = rate_limiter
+        if encryption_description is not None:
+            datax['encryption_description'] = encryption_description
         return datax
 
 
