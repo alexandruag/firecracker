@@ -10,9 +10,7 @@ use std::io::{self, Read, Seek, Write};
 
 use memory_model::{GuestAddress, GuestMemory, GuestMemoryError};
 use openssl::error::ErrorStack;
-use openssl::symm::decrypt as openssl_decrypt;
-use openssl::symm::encrypt as openssl_encrypt;
-use openssl::symm::Cipher;
+use openssl::symm::{Cipher, Crypter, Mode};
 use serde::de::{Deserialize, Deserializer, Error};
 use serde::ser::{Serialize, Serializer};
 
@@ -90,7 +88,7 @@ pub struct EncryptionContext {
     encryption_description: EncryptionDescription,
     cipher: Cipher,
     initial_buffer: [u8; SECTOR_SIZE],
-    final_buffer: Vec<u8>,
+    final_buffer: [u8; SECTOR_SIZE],
 }
 
 impl EncryptionContext {
@@ -99,9 +97,25 @@ impl EncryptionContext {
             encryption_description,
             cipher: Cipher::aes_256_xts(),
             initial_buffer: [0u8; SECTOR_SIZE],
-            final_buffer: Vec::new(),
+            final_buffer: [0u8; SECTOR_SIZE],
         }
     }
+
+    fn build_crypter(&self, mode: Mode, sector_index: u64) -> Crypter {
+        let iv = (sector_index as u128).to_le_bytes();
+        // It should be ok to use unwrap here because we're passing valid parameters to
+        // the constructor.
+        let mut crypter = Crypter::new(
+            self.cipher,
+            mode,
+            &self.encryption_description.key,
+            Some(&iv),
+        )
+        .unwrap();
+        crypter.pad(false);
+        crypter
+    }
+
     pub fn decrypt<T: Seek + Read + Write>(
         &mut self,
         disk: &mut T,
@@ -113,20 +127,18 @@ impl EncryptionContext {
         let num_sectors = (data_len / SECTOR_SIZE) as u64;
         let addr = &mut GuestAddress(data_addr.offset());
         for sector_offset in 0..num_sectors {
-            let iv: [u8; 16] = ((no_sector + sector_offset) as u128).to_le_bytes();
+            let mut crypter = self.build_crypter(Mode::Decrypt, no_sector + sector_offset);
 
             // Read_exact will fill the buffer or return an error, so we don't have to worry
             // about dealing with partial reads.
             disk.read_exact(&mut self.initial_buffer)
                 .map_err(EncryptionError::IOError)?;
 
-            self.final_buffer = openssl_decrypt(
-                self.cipher,
-                &self.encryption_description.key,
-                Some(&iv),
-                &mut self.initial_buffer,
-            )
-            .map_err(EncryptionError::OpensslError)?;
+            let num_bytes = crypter
+                .update(&self.initial_buffer, &mut self.final_buffer)
+                .map_err(EncryptionError::OpensslError)?;
+            // Sanity check: we expect update to finish decrypting the whole sector.
+            assert_eq!(num_bytes, SECTOR_SIZE);
 
             mem.write_slice_at_addr(&self.final_buffer, *addr)
                 .map_err(EncryptionError::MemoryError)?;
@@ -149,18 +161,16 @@ impl EncryptionContext {
         let num_sectors = (data_len / SECTOR_SIZE) as u64;
         let addr = &mut GuestAddress(data_addr.offset());
         for sector_offset in 0..num_sectors {
-            let iv: [u8; 16] = ((no_sector + sector_offset) as u128).to_le_bytes();
+            let mut crypter = self.build_crypter(Mode::Encrypt, no_sector + sector_offset);
 
             mem.read_slice_at_addr(&mut self.initial_buffer, *addr)
                 .map_err(EncryptionError::MemoryError)?;
 
-            self.final_buffer = openssl_encrypt(
-                self.cipher,
-                &self.encryption_description.key,
-                Some(&iv),
-                &mut self.initial_buffer,
-            )
-            .map_err(|e| EncryptionError::OpensslError(e))?;
+            let num_bytes = crypter
+                .update(&self.initial_buffer, &mut self.final_buffer)
+                .map_err(EncryptionError::OpensslError)?;
+            // Sanity check: we expect update to finish encrypting the whole sector.
+            assert_eq!(num_bytes, SECTOR_SIZE);
 
             // Write_all attempts to write everything or returns an error, so we don't have to
             // worry about dealing with partial writes.
