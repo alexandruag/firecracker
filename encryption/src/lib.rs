@@ -165,11 +165,14 @@ impl EncryptionContext {
         for sector_offset in 0..num_sectors {
             let mut crypter = self.build_crypter(Mode::Encrypt, no_sector + sector_offset);
 
-            mem.read_slice_at_addr(&mut self.initial_buffer, *addr)
+            // Safe because the slice is only used in the update function below, and it cannot get
+            // aliased. We could've used a non-mut slice here because we're just reading, but
+            // didn't add an extra method to GuestMemory yet.
+            let initial_buffer = unsafe { mem.mut_slice(*addr, SECTOR_SIZE) }
                 .map_err(EncryptionError::MemoryError)?;
 
             let num_bytes = crypter
-                .update(&self.initial_buffer, &mut self.final_buffer)
+                .update(initial_buffer, &mut self.final_buffer)
                 .map_err(EncryptionError::OpensslError)?;
             // Sanity check: we expect update to finish encrypting the whole sector.
             assert_eq!(num_bytes, SECTOR_SIZE);
