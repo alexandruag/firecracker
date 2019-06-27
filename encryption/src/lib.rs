@@ -134,14 +134,16 @@ impl EncryptionContext {
             disk.read_exact(&mut self.initial_buffer)
                 .map_err(EncryptionError::IOError)?;
 
+            // Safe because the slice is only used in the update function below, and it cannot get
+            // aliased.
+            let final_buffer = unsafe { mem.mut_slice(*addr, SECTOR_SIZE) }
+                .map_err(EncryptionError::MemoryError)?;
+
             let num_bytes = crypter
-                .update(&self.initial_buffer, &mut self.final_buffer)
+                .update(&self.initial_buffer, final_buffer)
                 .map_err(EncryptionError::OpensslError)?;
             // Sanity check: we expect update to finish decrypting the whole sector.
             assert_eq!(num_bytes, SECTOR_SIZE);
-
-            mem.write_slice_at_addr(&self.final_buffer, *addr)
-                .map_err(EncryptionError::MemoryError)?;
 
             // We should check for error here at some point instead of unwrapping.
             *addr = addr.checked_add(SECTOR_SIZE).unwrap();

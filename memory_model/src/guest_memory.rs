@@ -196,6 +196,19 @@ impl GuestMemory {
         })
     }
 
+    /// TODO: add actual comment.
+    pub unsafe fn mut_slice(&self, guest_addr: GuestAddress, len: usize) -> Result<&mut [u8]> {
+        for region in self.regions.iter() {
+            if guest_addr >= region.guest_base && guest_addr < region_end(region) {
+                let offset = guest_addr.offset_from(region.guest_base);
+
+                // Should've checked that offset + len fits within the MemoryRegion as well.
+                return Ok(&mut region.mapping.as_mut_slice()[offset..offset + len]);
+            }
+        }
+        Err(Error::InvalidGuestAddress(guest_addr))
+    }
+
     /// Reads to a slice from guest memory at the specified guest address.
     /// Returns the number of bytes read.  The number of bytes read can
     /// be less than the length of the slice if there isn't enough room in the
