@@ -32,6 +32,7 @@ use fc_util::validators::validate_instance_id;
 use logger::{Metric, LOGGER, METRICS};
 use mmds::MMDS;
 use sys_util::{EventFd, Terminal};
+use vmm::controller::VmmController;
 use vmm::signal_handler::register_signal_handlers;
 use vmm::vmm_config::instance_info::{InstanceInfo, InstanceState};
 use vmm::{EventLoopExitReason, Vmm};
@@ -259,8 +260,8 @@ fn start_vmm(
     config_json: Option<String>,
 ) {
     // If this fails, consider it fatal. Use expect().
-    let mut vmm =
-        Vmm::new(api_shared_info, &api_event_fd, seccomp_level).expect("Cannot create VMM");
+    let mut vmm = VmmController::new(api_shared_info, &api_event_fd, seccomp_level)
+        .expect("Cannot create VMM");
 
     if let Some(json) = config_json {
         vmm.configure_from_json(json).unwrap_or_else(|err| {
@@ -309,7 +310,7 @@ fn start_vmm(
 /// Receives and runs the Vmm action and sends back a response.
 /// Provides program exit codes on errors.
 fn vmm_control_event(
-    vmm: &mut Vmm,
+    vmm: &mut VmmController,
     api_event_fd: &EventFd,
     from_api: &Receiver<VmmRequest>,
     to_api: &Sender<VmmResponse>,

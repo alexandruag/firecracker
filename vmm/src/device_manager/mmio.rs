@@ -71,7 +71,7 @@ const MMIO_LEN: u64 = 0x1000;
 
 /// This represents the offset at which the device should call BusDevice::write in order to write
 /// to its configuration space.
-const MMIO_CFG_SPACE_OFF: u64 = 0x100;
+pub const MMIO_CFG_SPACE_OFF: u64 = 0x100;
 
 /// Manages the complexities of registering a MMIO device.
 pub struct MMIODeviceManager {
@@ -114,11 +114,25 @@ impl MMIODeviceManager {
         type_id: u32,
         device_id: &str,
     ) -> Result<u64> {
+        let mmio_device = devices::virtio::MmioDevice::new(self.guest_mem.clone(), device)
+            .map_err(Error::CreateMmioDevice)?;
+
+        self.register_mmio_device(vm, mmio_device, cmdline, type_id, device_id)
+    }
+
+    /// Register am already created MMIO device to be used via MMIO transport.
+    pub fn register_mmio_device(
+        &mut self,
+        vm: &VmFd,
+        mmio_device: devices::virtio::MmioDevice,
+        cmdline: &mut kernel_cmdline::Cmdline,
+        type_id: u32,
+        device_id: &str,
+    ) -> Result<u64> {
         if self.irq > self.last_irq {
             return Err(Error::IrqsExhausted);
         }
-        let mmio_device = devices::virtio::MmioDevice::new(self.guest_mem.clone(), device)
-            .map_err(Error::CreateMmioDevice)?;
+
         for (i, queue_evt) in mmio_device.queue_evts().iter().enumerate() {
             let io_addr = IoEventAddress::Mmio(
                 self.mmio_base + u64::from(devices::virtio::NOTIFY_REG_OFFSET),
