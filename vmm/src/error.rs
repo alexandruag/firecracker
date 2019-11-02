@@ -38,6 +38,10 @@ pub enum Error {
     Poll(io::Error),
     /// Write to the serial console failed.
     Serial(io::Error),
+    // Temporarily added for mixing calls that may return an Error with other that may return a
+    // StartMicrovmErrors within the same function.
+    /// TODO: add actual comment
+    StartMicrovm(StartMicrovmError),
     /// Cannot create Timer file descriptor.
     TimerFd(io::Error),
     /// Cannot open the VM file descriptor.
@@ -65,6 +69,8 @@ impl std::fmt::Debug for Error {
             KvmContext(e) => write!(f, "Failed to validate KVM support: {:?}", e),
             Poll(e) => write!(f, "Epoll wait failed: {}", e.to_string()),
             Serial(e) => write!(f, "Error writing to the serial console: {:?}", e),
+            // Temporarily added.
+            StartMicrovm(e) => write!(f, "Encountered a StartMicrovm error: {:?}", e),
             TimerFd(e) => write!(f, "Error creating timer fd: {}", e.to_string()),
             Vm(e) => write!(f, "Error opening VM fd: {:?}", e),
         }
