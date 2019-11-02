@@ -34,9 +34,11 @@ extern crate rate_limiter;
 extern crate seccomp;
 extern crate sys_util;
 
+/// Handles setup, initialization, and runtime configuration of a `Vmm` object.
+pub mod controller;
 /// Syscalls allowed through the seccomp filter.
 pub mod default_syscalls;
-mod device_manager;
+pub(crate) mod device_manager;
 pub mod error;
 /// Signal handling utilities.
 pub mod signal_handler;
@@ -158,7 +160,7 @@ impl MaybeHandler {
 // Handles epoll related business.
 // A glaring shortcoming of the current design is the liberal passing around of raw_fds,
 // and duping of file descriptors. This issue will be solved when we also implement device removal.
-struct EpollContext {
+pub(crate) struct EpollContext {
     epoll_raw_fd: RawFd,
     stdin_index: u64,
     // FIXME: find a different design as this does not scale. This Vec can only grow.
@@ -174,7 +176,7 @@ struct EpollContext {
 }
 
 impl EpollContext {
-    fn new() -> Result<Self> {
+    pub fn new() -> Result<Self> {
         const EPOLL_EVENTS_LEN: usize = 100;
 
         let epoll_raw_fd = epoll::create(true).map_err(Error::EpollFd)?;
@@ -200,7 +202,7 @@ impl EpollContext {
         })
     }
 
-    fn enable_stdin_event(&mut self) {
+    pub fn enable_stdin_event(&mut self) {
         if let Err(e) = epoll::ctl(
             self.epoll_raw_fd,
             epoll::ControlOptions::EPOLL_CTL_ADD,
@@ -219,7 +221,7 @@ impl EpollContext {
         }
     }
 
-    fn disable_stdin_event(&mut self) {
+    pub fn disable_stdin_event(&mut self) {
         // Ignore failure to remove from epoll. The only reason for failure is
         // that stdin has closed or changed in which case we won't get
         // any more events on the original event_fd anyway.
@@ -235,7 +237,7 @@ impl EpollContext {
     /// Given a file descriptor `fd`, and an EpollDispatch token `token`,
     /// associate `token` with an `EPOLLIN` event for `fd`, through the
     /// `dispatch_table`.
-    fn add_epollin_event<T: AsRawFd + ?Sized>(
+    pub fn add_epollin_event<T: AsRawFd + ?Sized>(
         &mut self,
         fd: &T,
         token: EpollDispatch,
@@ -264,7 +266,10 @@ impl EpollContext {
     /// This device's handler will be added to the end of `device_handlers`.
     /// This returns the index of the first token, and a channel on which to
     /// send an epoll handler for the relevant device.
-    fn allocate_tokens_for_device(&mut self, count: usize) -> (u64, Sender<Box<dyn EpollHandler>>) {
+    pub fn allocate_tokens_for_device(
+        &mut self,
+        count: usize,
+    ) -> (u64, Sender<Box<dyn EpollHandler>>) {
         let dispatch_base = self.dispatch_table.len() as u64;
         let device_idx = self.device_handlers.len();
         let (sender, receiver) = channel();
@@ -284,7 +289,7 @@ impl EpollContext {
     /// but also call T::new to create a device handler for the device. This handler
     /// will then be associated to a given `device_id` through the `device_id_to_handler_id`
     /// table. Finally, return the handler.
-    fn allocate_tokens_for_virtio_device<T: EpollConfigConstructor>(
+    pub fn allocate_tokens_for_virtio_device<T: EpollConfigConstructor>(
         &mut self,
         type_id: u32,
         device_id: &str,
@@ -300,7 +305,7 @@ impl EpollContext {
         T::new(dispatch_base, self.epoll_raw_fd, sender)
     }
 
-    fn get_device_handler_by_handler_id(&mut self, id: usize) -> Result<&mut dyn EpollHandler> {
+    pub fn get_device_handler_by_handler_id(&mut self, id: usize) -> Result<&mut dyn EpollHandler> {
         let maybe = &mut self.device_handlers[id];
         match maybe.handler {
             Some(ref mut v) => Ok(v.as_mut()),
@@ -319,7 +324,7 @@ impl EpollContext {
         }
     }
 
-    fn get_device_handler_by_device_id<T: EpollHandler + 'static>(
+    pub fn get_device_handler_by_device_id<T: EpollHandler + 'static>(
         &mut self,
         type_id: u32,
         device_id: &str,
@@ -336,7 +341,7 @@ impl EpollContext {
     }
 
     /// Gets the next event from `epoll_raw_fd`.
-    fn get_event(&mut self) -> Result<epoll::Event> {
+    pub fn get_event(&mut self) -> Result<epoll::Event> {
         // Check if no events are left in `events`:
         while self.num_events == self.event_index {
             // If so, get more events.
