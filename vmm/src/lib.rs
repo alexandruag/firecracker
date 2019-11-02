@@ -60,7 +60,6 @@ use std::time::Duration;
 
 use timerfd::{ClockId, SetTimeFlags, TimerFd, TimerState};
 
-#[cfg(target_arch = "aarch64")]
 use arch::DeviceType;
 #[cfg(target_arch = "x86_64")]
 use device_manager::legacy::PortIODeviceManager;
@@ -72,8 +71,7 @@ use devices::virtio::vsock::{TYPE_VSOCK, VSOCK_EVENTS_COUNT};
 use devices::virtio::EpollConfigConstructor;
 use devices::virtio::{BLOCK_EVENTS_COUNT, TYPE_BLOCK};
 use devices::virtio::{NET_EVENTS_COUNT, TYPE_NET};
-use devices::RawIOHandler;
-use devices::{DeviceEventT, EpollHandler};
+use devices::{BusDevice, DeviceEventT, EpollHandler, RawIOHandler};
 use error::{Error, Result, UserResult};
 use fc_util::time::TimestampUs;
 use kernel::cmdline as kernel_cmdline;
@@ -134,12 +132,18 @@ pub enum EventLoopExitReason {
     ControlAction,
 }
 
+/// Dispatch categories for epoll events.
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum EpollDispatch {
+pub enum EpollDispatch {
+    /// This dispatch type is now obsolete.
     Exit,
+    /// Stdin event.
     Stdin,
+    /// Event has to be dispatch to an EpollHandler.
     DeviceHandler(usize, DeviceEventT),
+    /// The event loop has to be temporarily suspended for an external action request.
     VmmActionRequest,
+    /// Periodically generated to write Vmm metrics.
     WriteMetrics,
 }
 
@@ -157,10 +161,10 @@ impl MaybeHandler {
     }
 }
 
-// Handles epoll related business.
+/// Handles epoll related business.
 // A glaring shortcoming of the current design is the liberal passing around of raw_fds,
 // and duping of file descriptors. This issue will be solved when we also implement device removal.
-pub(crate) struct EpollContext {
+pub struct EpollContext {
     epoll_raw_fd: RawFd,
     stdin_index: u64,
     // FIXME: find a different design as this does not scale. This Vec can only grow.
@@ -176,6 +180,7 @@ pub(crate) struct EpollContext {
 }
 
 impl EpollContext {
+    /// Creates a new `EpollContext` object.
     pub fn new() -> Result<Self> {
         const EPOLL_EVENTS_LEN: usize = 100;
 
@@ -202,6 +207,7 @@ impl EpollContext {
         })
     }
 
+    /// Registers an EPOLLIN event associated with the stdin file descriptor.
     pub fn enable_stdin_event(&mut self) {
         if let Err(e) = epoll::ctl(
             self.epoll_raw_fd,
@@ -221,6 +227,7 @@ impl EpollContext {
         }
     }
 
+    /// Removes the stdin event from the event set.
     pub fn disable_stdin_event(&mut self) {
         // Ignore failure to remove from epoll. The only reason for failure is
         // that stdin has closed or changed in which case we won't get
@@ -305,6 +312,7 @@ impl EpollContext {
         T::new(dispatch_base, self.epoll_raw_fd, sender)
     }
 
+    /// Obtains the `EpollHandler` trait object associated with the provided handler id.
     pub fn get_device_handler_by_handler_id(&mut self, id: usize) -> Result<&mut dyn EpollHandler> {
         let maybe = &mut self.device_handlers[id];
         match maybe.handler {
@@ -324,6 +332,8 @@ impl EpollContext {
         }
     }
 
+    /// Obtains a mut reference to an object implementing `EpollHandler` for the given device
+    /// type and identifier.
     pub fn get_device_handler_by_device_id<T: EpollHandler + 'static>(
         &mut self,
         type_id: u32,
@@ -474,6 +484,28 @@ impl Vmm {
     /// Returns the VmConfig of this Vmm.
     pub fn vm_config(&self) -> &VmConfig {
         &self.vm_config
+    }
+
+    /// Returns a borrowed handle for the inner `EpollContext` object.
+    pub fn epoll_context(&self) -> &EpollContext {
+        &self.epoll_context
+    }
+
+    /// Returns a mutable handle for the inner `EpollContext` object.
+    pub fn epoll_context_mut(&mut self) -> &mut EpollContext {
+        &mut self.epoll_context
+    }
+
+    /// Gets the the specified bus device.
+    pub fn get_bus_device(
+        &self,
+        device_type: DeviceType,
+        device_id: &str,
+    ) -> Option<&Mutex<dyn BusDevice>> {
+        self.mmio_device_manager
+            .as_ref()
+            .unwrap()
+            .get_device(device_type, device_id)
     }
 
     fn update_drive_handler(
