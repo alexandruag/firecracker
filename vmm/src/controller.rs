@@ -5,7 +5,8 @@ use std::result;
 use std::sync::{Arc, RwLock};
 
 use super::{
-    EpollContext, ErrorKind, UserResult, VmmActionError, VmmConfig, FC_EXIT_CODE_INVALID_JSON,
+    EpollContext, EpollDispatch, ErrorKind, Result, UserResult, Vmm, VmmActionError, VmmConfig,
+    FC_EXIT_CODE_INVALID_JSON,
 };
 
 use devices::legacy::I8042DeviceError;
@@ -16,6 +17,7 @@ use error::StartMicrovmError;
 use kernel::{cmdline as kernel_cmdline, loader as kernel_loader};
 use logger::{AppInfo, Level, LOGGER};
 use memory_model::{GuestAddress, GuestMemory};
+use sys_util::EventFd;
 use vmm_config;
 use vmm_config::boot_source::{
     BootSourceConfig, BootSourceConfigError, KernelConfig, DEFAULT_KERNEL_CMDLINE,
@@ -36,15 +38,15 @@ pub struct VmmController {
     device_configs: DeviceConfigs,
     epoll_context: Option<EpollContext>,
     guest_memory: Option<GuestMemory>,
-    instance_initialized: bool,
     kernel_config: Option<KernelConfig>,
     vm_config: VmConfig,
     shared_info: Arc<RwLock<InstanceInfo>>,
+    vmm: Option<Vmm>,
 }
 
 impl VmmController {
     fn is_instance_initialized(&self) -> bool {
-        false
+        self.vmm.is_some()
     }
 
     /// Inserts a block to be attached when the VM starts.
@@ -485,8 +487,33 @@ impl VmmController {
         Ok(())
     }
 
-    /// Starts a microVM based on the current configuration.
-    pub fn start_microvm(&mut self) {
-        self.instance_initialized = true;
+    /// Creates a new `VmmController`.
+    pub fn new(
+        api_shared_info: Arc<RwLock<InstanceInfo>>,
+        afi_event_fd: EventFd,
+        seccomp_level: u32,
+    ) -> Result<Self> {
+        let device_configs = DeviceConfigs::new(
+            BlockDeviceConfigs::new(),
+            NetworkInterfaceConfigs::new(),
+            None,
+        );
+
+        let mut epoll_context = EpollContext::new()?;
+        epoll_context
+            .add_epollin_event(&afi_event_fd, EpollDispatch::VmmActionRequest)
+            .expect("Cannot add vmm control_fd to epoll.");
+
+        Ok(VmmController {
+            device_configs,
+            epoll_context: Some(epoll_context),
+            guest_memory: None,
+            kernel_config: None,
+            vm_config: VmConfig::default(),
+            vmm: None,
+        })
     }
+
+    /// Starts a microVM based on the current configuration.
+    pub fn start_microvm(&mut self) {}
 }
