@@ -14,8 +14,9 @@ use arch::DeviceType;
 use device_manager::mmio::MMIO_CFG_SPACE_OFF;
 use devices::legacy::I8042DeviceError;
 use devices::virtio::vsock::{TYPE_VSOCK, VSOCK_EVENTS_COUNT};
-use devices::virtio::MmioDevice;
-use devices::virtio::{self, BLOCK_EVENTS_COUNT, NET_EVENTS_COUNT, TYPE_BLOCK, TYPE_NET};
+use devices::virtio::{
+    self, MmioDevice, BLOCK_EVENTS_COUNT, NET_EVENTS_COUNT, TYPE_BLOCK, TYPE_NET,
+};
 use error::StartMicrovmError;
 use kernel::{cmdline as kernel_cmdline, loader as kernel_loader};
 use logger::error::LoggerError;
@@ -46,6 +47,7 @@ pub struct VmmController {
     vm_config: VmConfig,
     shared_info: Arc<RwLock<InstanceInfo>>,
     vmm: Option<Vmm>,
+    seccomp_level: u32,
 }
 
 impl VmmController {
@@ -92,7 +94,7 @@ impl VmmController {
 
     fn append_block_devices(
         &mut self,
-        mmio_devices: &mut Vec<MmioDevice>,
+        mmio_devices: &mut Vec<(String, MmioDevice)>,
     ) -> result::Result<(), StartMicrovmError> {
         use StartMicrovmError::*;
 
@@ -164,9 +166,12 @@ impl VmmController {
                 .map_err(CreateBlockDevice)?,
             );
 
-            mmio_devices.push(MmioDevice::new(guest_memory, block_box).map_err(|e| {
-                RegisterMMIODevice(super::device_manager::mmio::Error::CreateMmioDevice(e))
-            })?);
+            mmio_devices.push((
+                drive_config.drive_id.clone(),
+                MmioDevice::new(guest_memory, block_box).map_err(|e| {
+                    RegisterMMIODevice(super::device_manager::mmio::Error::CreateMmioDevice(e))
+                })?,
+            ));
         }
 
         Ok(())
@@ -174,7 +179,7 @@ impl VmmController {
 
     fn append_net_devices(
         &mut self,
-        mmio_devices: &mut Vec<MmioDevice>,
+        mmio_devices: &mut Vec<(String, MmioDevice)>,
     ) -> result::Result<(), StartMicrovmError> {
         use StartMicrovmError::*;
 
@@ -220,16 +225,19 @@ impl VmmController {
                 .map_err(CreateNetDevice)?,
             );
 
-            mmio_devices.push(MmioDevice::new(guest_memory, net_box).map_err(|e| {
-                RegisterMMIODevice(super::device_manager::mmio::Error::CreateMmioDevice(e))
-            })?);
+            mmio_devices.push((
+                cfg.iface_id.clone(),
+                MmioDevice::new(guest_memory, net_box).map_err(|e| {
+                    RegisterMMIODevice(super::device_manager::mmio::Error::CreateMmioDevice(e))
+                })?,
+            ));
         }
         Ok(())
     }
 
     fn append_vsock_device(
         &mut self,
-        mmio_devices: &mut Vec<MmioDevice>,
+        mmio_devices: &mut Vec<(String, MmioDevice)>,
     ) -> result::Result<(), StartMicrovmError> {
         let kernel_config = self
             .kernel_config
@@ -258,11 +266,14 @@ impl VmmController {
                     .map_err(StartMicrovmError::CreateVsockDevice)?,
             );
 
-            mmio_devices.push(MmioDevice::new(guest_memory, vsock_box).map_err(|e| {
-                StartMicrovmError::RegisterMMIODevice(
-                    super::device_manager::mmio::Error::CreateMmioDevice(e),
-                )
-            })?);
+            mmio_devices.push((
+                cfg.vsock_id.clone(),
+                MmioDevice::new(guest_memory, vsock_box).map_err(|e| {
+                    StartMicrovmError::RegisterMMIODevice(
+                        super::device_manager::mmio::Error::CreateMmioDevice(e),
+                    )
+                })?,
+            ));
         }
         Ok(())
     }
@@ -560,11 +571,37 @@ impl VmmController {
             vm_config: VmConfig::default(),
             shared_info: api_shared_info,
             vmm: None,
+            seccomp_level,
         })
     }
 
     /// Starts a microVM based on the current configuration.
     pub fn start_microvm(&mut self) -> UserResult {
+        self.init_guest_memory()?;
+        // Adding devices to the vec first, because they require self.kernel_config which
+        // is subsequently take()-en.
+        let mut devices = Vec::new();
+        self.append_block_devices(&mut devices)?;
+        self.append_net_devices(&mut devices)?;
+        self.append_vsock_device(&mut devices)?;
+
+        let epoll_context = self.epoll_context.take().expect("epoll_context");
+        let kernel_config = self.kernel_config.take().expect("kernel_config");
+
+        let vmm = Vmm::spawn(
+            epoll_context,
+            // TODO: Unwrap should not fail because first line in this function. Still, should
+            // make this prettier.
+            self.guest_memory.take().unwrap(),
+            kernel_config,
+            self.vm_config.clone(),
+            self.shared_info.clone(),
+            self.seccomp_level,
+            devices,
+        )?;
+
+        self.vmm = Some(vmm);
+
         Ok(())
     }
 
