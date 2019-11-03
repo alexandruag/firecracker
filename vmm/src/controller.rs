@@ -1,20 +1,24 @@
 use std::fmt::{Display, Formatter};
-use std::fs::{File, OpenOptions};
+use std::fs::{metadata, File, OpenOptions};
+use std::path::PathBuf;
 use std::process;
 use std::result;
 use std::sync::{Arc, RwLock};
 
 use super::{
-    EpollContext, EpollDispatch, ErrorKind, Result, UserResult, Vmm, VmmActionError, VmmConfig,
-    FC_EXIT_CODE_INVALID_JSON,
+    EpollContext, EpollDispatch, ErrorKind, EventLoopExitReason, Result, UserResult, Vmm,
+    VmmActionError, VmmConfig, FC_EXIT_CODE_INVALID_JSON,
 };
 
+use arch::DeviceType;
+use device_manager::mmio::MMIO_CFG_SPACE_OFF;
 use devices::legacy::I8042DeviceError;
 use devices::virtio::vsock::{TYPE_VSOCK, VSOCK_EVENTS_COUNT};
 use devices::virtio::MmioDevice;
-use devices::virtio::{BLOCK_EVENTS_COUNT, NET_EVENTS_COUNT, TYPE_BLOCK, TYPE_NET};
+use devices::virtio::{self, BLOCK_EVENTS_COUNT, NET_EVENTS_COUNT, TYPE_BLOCK, TYPE_NET};
 use error::StartMicrovmError;
 use kernel::{cmdline as kernel_cmdline, loader as kernel_loader};
+use logger::error::LoggerError;
 use logger::{AppInfo, Level, LOGGER};
 use memory_model::{GuestAddress, GuestMemory};
 use sys_util::EventFd;
@@ -487,10 +491,54 @@ impl VmmController {
         Ok(())
     }
 
+    /// Returns the VmConfig.
+    pub fn vm_config(&self) -> &VmConfig {
+        &self.vm_config
+    }
+
+    /// Flush metrics. Defer to inner Vmm if present. We'll move to a variant where the Vmm
+    /// simply exposes functionality like getting the dirty pages, and then we'll have the
+    /// metrics flushing logic entirely on the outside.
+    pub fn flush_metrics(&mut self) -> UserResult {
+        if let Some(vmm) = self.vmm.as_mut() {
+            vmm.flush_metrics()
+        } else {
+            // Copied from Vmm.
+            LOGGER.log_metrics().map(|_| ()).map_err(|e| {
+                let (kind, error_contents) = match e {
+                    LoggerError::NeverInitialized(s) => (ErrorKind::User, s),
+                    _ => (ErrorKind::Internal, e.to_string()),
+                };
+                VmmActionError::Logger(kind, LoggerConfigError::FlushMetrics(error_contents))
+            })
+        }
+    }
+
+    /// Injects CTRL+ALT+DEL keystroke combo to the inner Vmm (if present).
+    #[cfg(target_arch = "x86_64")]
+    pub fn send_ctrl_alt_del(&mut self) -> UserResult {
+        if let Some(vmm) = self.vmm.as_mut() {
+            vmm.send_ctrl_alt_del()
+        } else {
+            // TODO: An error would prob be more informative.
+            Ok(())
+        }
+    }
+
+    /// Stops the inner Vmm (if present) and exits the process with the provided exit_code.
+    pub fn stop(&mut self, exit_code: i32) {
+        if let Some(vmm) = self.vmm.as_mut() {
+            // This currently exits the process.
+            vmm.stop(exit_code)
+        } else {
+            process::exit(exit_code)
+        }
+    }
+
     /// Creates a new `VmmController`.
     pub fn new(
         api_shared_info: Arc<RwLock<InstanceInfo>>,
-        afi_event_fd: EventFd,
+        afi_event_fd: &EventFd,
         seccomp_level: u32,
     ) -> Result<Self> {
         let device_configs = DeviceConfigs::new(
@@ -501,7 +549,7 @@ impl VmmController {
 
         let mut epoll_context = EpollContext::new()?;
         epoll_context
-            .add_epollin_event(&afi_event_fd, EpollDispatch::VmmActionRequest)
+            .add_epollin_event(afi_event_fd, EpollDispatch::VmmActionRequest)
             .expect("Cannot add vmm control_fd to epoll.");
 
         Ok(VmmController {
@@ -510,10 +558,183 @@ impl VmmController {
             guest_memory: None,
             kernel_config: None,
             vm_config: VmConfig::default(),
+            shared_info: api_shared_info,
             vmm: None,
         })
     }
 
     /// Starts a microVM based on the current configuration.
-    pub fn start_microvm(&mut self) {}
+    pub fn start_microvm(&mut self) -> UserResult {
+        Ok(())
+    }
+
+    /// Wait for and dispatch events. Will defer to the inner Vmm loop after it's started.
+    pub fn run_event_loop(&mut self) -> Result<EventLoopExitReason> {
+        if let Some(vmm) = self.vmm.as_mut() {
+            vmm.run_event_loop()
+        } else {
+            // The only possible event so far is getting a command from the API server. The
+            // unwrap should not fail because the EpollContext hasn't been passed yet to the
+            // inner Vmm.
+            let _ = self.epoll_context.as_mut().unwrap().get_event()?;
+            Ok(EventLoopExitReason::ControlAction)
+        }
+    }
+
+    /// Triggers a rescan of the host file backing the emulated block device with id `drive_id`.
+    pub fn rescan_block_device(&mut self, drive_id: &str) -> UserResult {
+        // Rescan can only happen after the guest is booted.
+        if let Some(vmm) = self.vmm.as_mut() {
+            for drive_config in self.device_configs.block.config_list.iter() {
+                if drive_config.drive_id != *drive_id {
+                    continue;
+                }
+
+                let metadata = metadata(&drive_config.path_on_host)
+                    .map_err(|_| DriveError::BlockDeviceUpdateFailed)?;
+                let new_size = metadata.len();
+                if new_size % virtio::block::SECTOR_SIZE != 0 {
+                    warn!(
+                        "Disk size {} is not a multiple of sector size {}; \
+                         the remainder will not be visible to the guest.",
+                        new_size,
+                        virtio::block::SECTOR_SIZE
+                    );
+                }
+
+                return match vmm.get_bus_device(DeviceType::Virtio(TYPE_BLOCK), drive_id) {
+                    Some(device) => {
+                        let data = devices::virtio::build_config_space(new_size);
+                        let mut busdev = device.lock().map_err(|_| {
+                            VmmActionError::from(DriveError::BlockDeviceUpdateFailed)
+                        })?;
+
+                        busdev.write(MMIO_CFG_SPACE_OFF, &data[..]);
+                        busdev.interrupt(devices::virtio::VIRTIO_MMIO_INT_CONFIG);
+
+                        Ok(())
+                    }
+                    None => Err(VmmActionError::from(DriveError::BlockDeviceUpdateFailed)),
+                };
+            }
+        } else {
+            return Err(DriveError::OperationNotAllowedPreBoot.into());
+        }
+
+        Err(VmmActionError::from(DriveError::InvalidBlockDeviceID))
+    }
+
+    fn update_drive_handler(
+        &mut self,
+        drive_id: &str,
+        disk_image: File,
+    ) -> result::Result<(), DriveError> {
+        // The unwrap is safe because this is only called after the inner Vmm has booted.
+        let handler = self
+            .vmm
+            .as_mut()
+            .unwrap()
+            .epoll_context_mut()
+            .get_device_handler_by_device_id::<virtio::BlockEpollHandler>(TYPE_BLOCK, drive_id)
+            .map_err(|_| DriveError::EpollHandlerNotFound)?;
+
+        handler
+            .update_disk_image(disk_image)
+            .map_err(|_| DriveError::BlockDeviceUpdateFailed)
+    }
+
+    /// Updates the path of the host file backing the emulated block device with id `drive_id`.
+    pub fn set_block_device_path(&mut self, drive_id: String, path_on_host: String) -> UserResult {
+        // Get the block device configuration specified by drive_id.
+        let block_device_index = self
+            .device_configs
+            .block
+            .get_index_of_drive_id(&drive_id)
+            .ok_or(DriveError::InvalidBlockDeviceID)?;
+
+        let file_path = PathBuf::from(path_on_host);
+        // Try to open the file specified by path_on_host using the permissions of the block_device.
+        let disk_file = OpenOptions::new()
+            .read(true)
+            .write(!self.device_configs.block.config_list[block_device_index].is_read_only())
+            .open(&file_path)
+            .map_err(|_| DriveError::CannotOpenBlockDevice)?;
+
+        // Update the path of the block device with the specified path_on_host.
+        self.device_configs.block.config_list[block_device_index].path_on_host = file_path;
+
+        // When the microvm is running, we also need to update the drive handler and send a
+        // rescan command to the drive.
+        if self.is_instance_initialized() {
+            self.update_drive_handler(&drive_id, disk_file)?;
+            self.rescan_block_device(&drive_id)?;
+        }
+        Ok(())
+    }
+
+    /// Updates configuration for an emulated net device as described in `new_cfg`.
+    pub fn update_net_device(&mut self, new_cfg: NetworkInterfaceUpdateConfig) -> UserResult {
+        if !self.is_instance_initialized() {
+            // VM not started yet, so we only need to update the device configs, not the actual
+            // live device.
+            let old_cfg = self
+                .device_configs
+                .network_interface
+                .iter_mut()
+                .find(|&&mut ref c| c.iface_id == new_cfg.iface_id)
+                .ok_or(NetworkInterfaceError::DeviceIdNotFound)?;
+
+            macro_rules! update_rate_limiter {
+                ($rate_limiter: ident) => {{
+                    if let Some(new_rlim_cfg) = new_cfg.$rate_limiter {
+                        if let Some(ref mut old_rlim_cfg) = old_cfg.$rate_limiter {
+                            // We already have an RX rate limiter set, so we'll update it.
+                            old_rlim_cfg.update(&new_rlim_cfg);
+                        } else {
+                            // No old RX rate limiter; create one now.
+                            old_cfg.$rate_limiter = Some(new_rlim_cfg);
+                        }
+                    }
+                }};
+            }
+
+            update_rate_limiter!(rx_rate_limiter);
+            update_rate_limiter!(tx_rate_limiter);
+        } else {
+            // If we got to here, the VM is running, so the unwrap is safe. We need to update the
+            // live device.
+
+            let handler = self
+                .vmm
+                .as_mut()
+                .unwrap()
+                .epoll_context_mut()
+                .get_device_handler_by_device_id::<virtio::NetEpollHandler>(
+                    TYPE_NET,
+                    &new_cfg.iface_id,
+                )
+                .map_err(NetworkInterfaceError::EpollHandlerNotFound)?;
+
+            macro_rules! get_handler_arg {
+                ($rate_limiter: ident, $metric: ident) => {{
+                    new_cfg
+                        .$rate_limiter
+                        .map(|rl| {
+                            rl.$metric
+                                .map(vmm_config::TokenBucketConfig::into_token_bucket)
+                        })
+                        .unwrap_or(None)
+                }};
+            }
+
+            handler.patch_rate_limiters(
+                get_handler_arg!(rx_rate_limiter, bandwidth),
+                get_handler_arg!(rx_rate_limiter, ops),
+                get_handler_arg!(tx_rate_limiter, bandwidth),
+                get_handler_arg!(tx_rate_limiter, ops),
+            );
+        }
+
+        Ok(())
+    }
 }

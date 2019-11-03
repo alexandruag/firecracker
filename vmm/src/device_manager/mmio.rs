@@ -71,7 +71,7 @@ const MMIO_LEN: u64 = 0x1000;
 
 /// This represents the offset at which the device should call BusDevice::write in order to write
 /// to its configuration space.
-const MMIO_CFG_SPACE_OFF: u64 = 0x100;
+pub const MMIO_CFG_SPACE_OFF: u64 = 0x100;
 
 /// Manages the complexities of registering a MMIO device.
 pub struct MMIODeviceManager {
