@@ -775,3 +775,144 @@ impl VmmController {
         Ok(())
     }
 }
+
+/*
+#[cfg(test)]
+mod tests {
+    extern crate tempfile;
+
+    use super::*;
+
+    use self::tempfile::NamedTempFile;
+
+    fn create_controller_object() -> VmmController {
+        let shared_info = Arc::new(RwLock::new(InstanceInfo {
+            state,
+            id: "TEST_ID".to_string(),
+            vmm_version: "1.0".to_string(),
+        }));
+
+        VmmController::new(shared_info, &EventFd::new().expect("Cannot create eventFD"), seccomp::SECCOMP_LEVEL_NONE,)
+            .expect("Cannot Create VMM controller")
+    }
+
+    #[test]
+    fn test_attach_block_devices() {
+        let mut ctrl = create_controller_object();
+        let block_file = NamedTempFile::new().unwrap();
+
+        // Use Case 1: Root Block Device is not specified through PARTUUID.
+        let root_block_device = BlockDeviceConfig {
+            drive_id: String::from("root"),
+            path_on_host: block_file.path().to_path_buf(),
+            is_root_device: true,
+            partuuid: None,
+            is_read_only: false,
+            rate_limiter: None,
+        };
+
+        // Test that creating a new block device returns the correct output.
+        assert!(ctrl.insert_block_device(root_block_device.clone()).is_ok());
+        assert!(ctrl.init_guest_memory().is_ok());
+        assert!(ctrl.guest_memory().is_some());
+        assert!(ctrl.setup_interrupt_controller().is_ok());
+
+        ctrl.default_kernel_config(None);
+        ctrl.init_mmio_device_manager()
+            .expect("Cannot initialize mmio device manager");
+
+        assert!(ctrl.attach_block_devices().is_ok());
+        assert!(ctrl.get_kernel_cmdline_str().contains("root=/dev/vda rw"));
+
+        // Use Case 2: Root Block Device is specified through PARTUUID.
+        let mut vmm = create_vmm_object(InstanceState::Uninitialized);
+        let root_block_device = BlockDeviceConfig {
+            drive_id: String::from("root"),
+            path_on_host: block_file.path().to_path_buf(),
+            is_root_device: true,
+            partuuid: Some("0eaa91a0-01".to_string()),
+            is_read_only: false,
+            rate_limiter: None,
+        };
+
+        // Test that creating a new block device returns the correct output.
+        assert!(vmm.insert_block_device(root_block_device.clone()).is_ok());
+        assert!(vmm.init_guest_memory().is_ok());
+        assert!(vmm.guest_memory().is_some());
+        assert!(vmm.setup_interrupt_controller().is_ok());
+
+        vmm.default_kernel_config(None);
+        vmm.init_mmio_device_manager()
+            .expect("Cannot initialize mmio device manager");
+
+        assert!(vmm.attach_block_devices().is_ok());
+        assert!(vmm
+            .get_kernel_cmdline_str()
+            .contains("root=PARTUUID=0eaa91a0-01 rw"));
+
+        // Use Case 3: Root Block Device is not added at all.
+        let mut vmm = create_vmm_object(InstanceState::Uninitialized);
+        let non_root_block_device = BlockDeviceConfig {
+            drive_id: String::from("not_root"),
+            path_on_host: block_file.path().to_path_buf(),
+            is_root_device: false,
+            partuuid: Some("0eaa91a0-01".to_string()),
+            is_read_only: false,
+            rate_limiter: None,
+        };
+
+        // Test that creating a new block device returns the correct output.
+        assert!(vmm
+            .insert_block_device(non_root_block_device.clone())
+            .is_ok());
+        assert!(vmm.init_guest_memory().is_ok());
+        assert!(vmm.guest_memory().is_some());
+        assert!(vmm.setup_interrupt_controller().is_ok());
+
+        vmm.default_kernel_config(None);
+        vmm.init_mmio_device_manager()
+            .expect("Cannot initialize mmio device manager");
+
+        assert!(vmm.attach_block_devices().is_ok());
+        // Test that kernel commandline does not contain either /dev/vda or PARTUUID.
+        assert!(!vmm.get_kernel_cmdline_str().contains("root=PARTUUID="));
+        assert!(!vmm.get_kernel_cmdline_str().contains("root=/dev/vda"));
+
+        // Test that the non root device is attached.
+        {
+            let device_manager = vmm.mmio_device_manager.as_ref().unwrap();
+            assert!(device_manager
+                .get_device(
+                    DeviceType::Virtio(TYPE_BLOCK),
+                    &non_root_block_device.drive_id
+                )
+                .is_some());
+        }
+
+        // Test partial update of block devices.
+        let new_block = NamedTempFile::new().unwrap();
+        let path = String::from(new_block.path().to_path_buf().to_str().unwrap());
+        assert!(vmm
+            .set_block_device_path("not_root".to_string(), path)
+            .is_ok());
+
+        // Test partial update of block device fails due to invalid file.
+        assert!(vmm
+            .set_block_device_path("not_root".to_string(), String::from("dummy_path"))
+            .is_err());
+
+        vmm.set_instance_state(InstanceState::Running);
+
+        // Test updating the block device path, after instance start.
+        let path = String::from(new_block.path().to_path_buf().to_str().unwrap());
+        match vmm.set_block_device_path("not_root".to_string(), path) {
+            Err(VmmActionError::DriveConfig(ErrorKind::User, DriveError::EpollHandlerNotFound)) => {
+            }
+            Err(e) => panic!("Unexpected error: {:?}", e),
+            Ok(_) => {
+                panic!("Updating block device path shouldn't be possible without an epoll handler.")
+            }
+        }
+    }
+}
+*/
