@@ -537,7 +537,7 @@ impl Vmm {
             self.attach_legacy_devices()?;
         }
 
-        vmm.configure_system()?;
+        vmm.configure_system(vcpus.as_slice())?;
 
         vmm.register_events()?;
 
