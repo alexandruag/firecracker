@@ -568,58 +568,6 @@ impl Vmm {
         Ok(vmm)
     }
 
-    /// Creates a new VMM object.
-    pub fn new(
-        shared_info: Arc<RwLock<InstanceInfo>>,
-        control_fd: &dyn AsRawFd,
-        seccomp_level: u32,
-    ) -> Result<Self> {
-        let mut epoll_context = EpollContext::new()?;
-        // If this fails, it's fatal; using expect() to crash.
-        epoll_context
-            .add_epollin_event(control_fd, EpollDispatch::VmmActionRequest)
-            .expect("Cannot add vmm control_fd to epoll.");
-
-        let write_metrics_event_fd =
-            TimerFd::new_custom(ClockId::Monotonic, true, true).map_err(Error::TimerFd)?;
-
-        epoll_context
-            .add_epollin_event(
-                // non-blocking & close on exec
-                &write_metrics_event_fd,
-                EpollDispatch::WriteMetrics,
-            )
-            .expect("Cannot add write metrics TimerFd to epoll.");
-
-        let device_configs = DeviceConfigs::new(
-            BlockDeviceConfigs::new(),
-            NetworkInterfaceConfigs::new(),
-            None,
-        );
-
-        let kvm = KvmContext::new().map_err(Error::KvmContext)?;
-        let vm = Vm::new(kvm.fd()).map_err(Error::Vm)?;
-
-        Ok(Vmm {
-            kvm,
-            vm_config: VmConfig::default(),
-            shared_info,
-            stdin_handle: io::stdin(),
-            guest_memory: None,
-            kernel_config: None,
-            vcpus_handles: vec![],
-            exit_evt: None,
-            vm,
-            mmio_device_manager: None,
-            #[cfg(target_arch = "x86_64")]
-            pio_device_manager: PortIODeviceManager::new().map_err(Error::CreateLegacyDevice)?,
-            device_configs,
-            epoll_context,
-            write_metrics_event_fd,
-            seccomp_level,
-        })
-    }
-
     /// Returns the VmConfig of this Vmm.
     pub fn vm_config(&self) -> &VmConfig {
         &self.vm_config
@@ -1227,9 +1175,69 @@ impl Vmm {
     }
 }
 
-/*
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    impl Vmm {
+        // Left around here because it's called by tests::create_vmm_object in the device_manager
+        // mmio module.
+        /// Creates a new VMM object.
+        pub fn new(
+            shared_info: Arc<RwLock<InstanceInfo>>,
+            control_fd: &dyn AsRawFd,
+            seccomp_level: u32,
+        ) -> Result<Self> {
+            let mut epoll_context = EpollContext::new()?;
+            // If this fails, it's fatal; using expect() to crash.
+            epoll_context
+                .add_epollin_event(control_fd, EpollDispatch::VmmActionRequest)
+                .expect("Cannot add vmm control_fd to epoll.");
+
+            let write_metrics_event_fd =
+                TimerFd::new_custom(ClockId::Monotonic, true, true).map_err(Error::TimerFd)?;
+
+            epoll_context
+                .add_epollin_event(
+                    // non-blocking & close on exec
+                    &write_metrics_event_fd,
+                    EpollDispatch::WriteMetrics,
+                )
+                .expect("Cannot add write metrics TimerFd to epoll.");
+
+            let device_configs = DeviceConfigs::new(
+                BlockDeviceConfigs::new(),
+                NetworkInterfaceConfigs::new(),
+                None,
+            );
+
+            let kvm = KvmContext::new().map_err(Error::KvmContext)?;
+            let vm = Vm::new(kvm.fd()).map_err(Error::Vm)?;
+
+            Ok(Vmm {
+                kvm,
+                vm_config: VmConfig::default(),
+                shared_info,
+                stdin_handle: io::stdin(),
+                guest_memory: None,
+                kernel_config: None,
+                vcpus_handles: vec![],
+                exit_evt: None,
+                vm,
+                mmio_device_manager: None,
+                #[cfg(target_arch = "x86_64")]
+                pio_device_manager: PortIODeviceManager::new()
+                    .map_err(Error::CreateLegacyDevice)?,
+                device_configs,
+                epoll_context,
+                write_metrics_event_fd,
+                seccomp_level,
+            })
+        }
+    }
+}
+
+/*
     macro_rules! assert_match {
         ($x:expr, $y:pat) => {{
             if let $y = $x {
@@ -1419,90 +1427,7 @@ mod tests {
         assert!(ep.get_device_handler_by_handler_id(0).is_ok());
     }
 
-    #[test]
-    fn test_insert_block_device() {
-        let mut vmm = create_vmm_object(InstanceState::Uninitialized);
-        let f = NamedTempFile::new().unwrap();
-        // Test that creating a new block device returns the correct output.
-        let root_block_device = BlockDeviceConfig {
-            drive_id: String::from("root"),
-            path_on_host: f.path().to_path_buf(),
-            is_root_device: true,
-            partuuid: None,
-            is_read_only: false,
-            rate_limiter: None,
-        };
-        assert!(vmm.insert_block_device(root_block_device.clone()).is_ok());
-        assert!(vmm
-            .device_configs
-            .block
-            .config_list
-            .contains(&root_block_device));
 
-        // Test that updating a block device returns the correct output.
-        let root_block_device = BlockDeviceConfig {
-            drive_id: String::from("root"),
-            path_on_host: f.path().to_path_buf(),
-            is_root_device: true,
-            partuuid: None,
-            is_read_only: true,
-            rate_limiter: None,
-        };
-        assert!(vmm.insert_block_device(root_block_device.clone()).is_ok());
-        assert!(vmm
-            .device_configs
-            .block
-            .config_list
-            .contains(&root_block_device));
-
-        // Test insert second drive with the same path fails.
-        let root_block_device = BlockDeviceConfig {
-            drive_id: String::from("dummy_dev"),
-            path_on_host: f.path().to_path_buf(),
-            is_root_device: false,
-            partuuid: None,
-            is_read_only: true,
-            rate_limiter: None,
-        };
-        assert!(vmm.insert_block_device(root_block_device.clone()).is_err());
-
-        // Test inserting a second drive is ok.
-        let f = NamedTempFile::new().unwrap();
-        // Test that creating a new block device returns the correct output.
-        let non_root = BlockDeviceConfig {
-            drive_id: String::from("non_root"),
-            path_on_host: f.path().to_path_buf(),
-            is_root_device: false,
-            partuuid: None,
-            is_read_only: false,
-            rate_limiter: None,
-        };
-        assert!(vmm.insert_block_device(non_root).is_ok());
-
-        // Test that making the second device root fails (it would result in 2 root block
-        // devices.
-        let non_root = BlockDeviceConfig {
-            drive_id: String::from("non_root"),
-            path_on_host: f.path().to_path_buf(),
-            is_root_device: true,
-            partuuid: None,
-            is_read_only: false,
-            rate_limiter: None,
-        };
-        assert!(vmm.insert_block_device(non_root).is_err());
-
-        // Test update after boot.
-        vmm.set_instance_state(InstanceState::Running);
-        let root_block_device = BlockDeviceConfig {
-            drive_id: String::from("root"),
-            path_on_host: f.path().to_path_buf(),
-            is_root_device: false,
-            partuuid: None,
-            is_read_only: true,
-            rate_limiter: None,
-        };
-        assert!(vmm.insert_block_device(root_block_device).is_err())
-    }
 
     #[test]
     fn test_insert_net_device() {
