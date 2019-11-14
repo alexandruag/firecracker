@@ -7,7 +7,7 @@ use std::sync::{Arc, RwLock};
 
 use super::{
     EpollContext, EpollDispatch, ErrorKind, EventLoopExitReason, Result, UserResult, Vmm,
-    VmmActionError, VmmConfig, FC_EXIT_CODE_INVALID_JSON,
+    VmmActionError, VmmBuilder, VmmConfig, FC_EXIT_CODE_INVALID_JSON,
 };
 
 use arch::DeviceType;
@@ -17,6 +17,7 @@ use devices::virtio::vsock::{TYPE_VSOCK, VSOCK_EVENTS_COUNT};
 use devices::virtio::{
     self, MmioDevice, BLOCK_EVENTS_COUNT, NET_EVENTS_COUNT, TYPE_BLOCK, TYPE_NET,
 };
+use error::Error::StartMicrovm;
 use error::StartMicrovmError;
 use kernel::{cmdline as kernel_cmdline, loader as kernel_loader};
 use logger::error::LoggerError;
@@ -93,19 +94,23 @@ impl VmmController {
         }
     }
 
-    fn append_block_devices(
+    fn attach_block_devices(
         &mut self,
-        mmio_devices: &mut Vec<(String, MmioDevice)>,
+        builder: &mut VmmBuilder,
     ) -> result::Result<(), StartMicrovmError> {
         use StartMicrovmError::*;
-
-        // We rely on check_health function for making sure kernel_config is not None.
-        let kernel_config = self.kernel_config.as_mut().ok_or(MissingKernelConfig)?;
 
         // If no PARTUUID was specified for the root device, try with the /dev/vda.
         if self.device_configs.block.has_root_block_device()
             && !self.device_configs.block.has_partuuid_root()
         {
+            // We rely on check_health function for making sure kernel_config is not None.
+            let kernel_config = builder
+                .inner_mut()
+                .kernel_config
+                .as_mut()
+                .ok_or(MissingKernelConfig)?;
+
             kernel_config.cmdline.insert_str("root=/dev/vda")?;
 
             let flags = if self.device_configs.block.has_read_only_root() {
@@ -118,10 +123,6 @@ impl VmmController {
         }
 
         for drive_config in self.device_configs.block.config_list.iter_mut() {
-            // Unwraps are safe as both options shouldn't be None when this method is called.
-            let epoll_context = self.epoll_context.as_mut().unwrap();
-            let guest_memory = self.guest_memory.as_ref().unwrap().clone();
-
             // Add the block device from file.
             let block_file = OpenOptions::new()
                 .read(true)
@@ -130,6 +131,13 @@ impl VmmController {
                 .map_err(OpenBlockDevice)?;
 
             if drive_config.is_root_device && drive_config.get_partuuid().is_some() {
+                // We rely on check_health function for making sure kernel_config is not None.
+                let kernel_config = builder
+                    .inner_mut()
+                    .kernel_config
+                    .as_mut()
+                    .ok_or(MissingKernelConfig)?;
+
                 kernel_config.cmdline.insert_str(format!(
                     "root=PARTUUID={}",
                     //The unwrap is safe as we are firstly checking that partuuid is_some().
@@ -145,11 +153,14 @@ impl VmmController {
                 kernel_config.cmdline.insert_str(flags)?;
             }
 
-            let epoll_config = epoll_context.allocate_tokens_for_virtio_device(
-                TYPE_BLOCK,
-                &drive_config.drive_id,
-                BLOCK_EVENTS_COUNT,
-            );
+            let epoll_config = builder
+                .inner_mut()
+                .epoll_context_mut()
+                .allocate_tokens_for_virtio_device(
+                    TYPE_BLOCK,
+                    &drive_config.drive_id,
+                    BLOCK_EVENTS_COUNT,
+                );
 
             let rate_limiter = drive_config
                 .rate_limiter
@@ -167,36 +178,30 @@ impl VmmController {
                 .map_err(CreateBlockDevice)?,
             );
 
-            mmio_devices.push((
+            // Unwrap is ok to use because the guest memory is configured.
+            builder.attach_device(
                 drive_config.drive_id.clone(),
-                MmioDevice::new(guest_memory, block_box).map_err(|e| {
-                    RegisterMMIODevice(super::device_manager::mmio::Error::CreateMmioDevice(e))
-                })?,
-            ));
+                MmioDevice::new(builder.inner().guest_memory().unwrap().clone(), block_box)
+                    .map_err(|e| {
+                        RegisterMMIODevice(super::device_manager::mmio::Error::CreateMmioDevice(e))
+                    })?,
+            )?;
         }
 
         Ok(())
     }
 
-    fn append_net_devices(
+    fn attach_net_devices(
         &mut self,
-        mmio_devices: &mut Vec<(String, MmioDevice)>,
+        builder: &mut VmmBuilder,
     ) -> result::Result<(), StartMicrovmError> {
         use StartMicrovmError::*;
 
-        // We rely on check_health function for making sure kernel_config is not None.
-        let kernel_config = self.kernel_config.as_mut().ok_or(MissingKernelConfig)?;
-
         for cfg in self.device_configs.network_interface.iter_mut() {
-            // Unwraps are safe as both options shouldn't be None when this method is called.
-            let epoll_context = self.epoll_context.as_mut().unwrap();
-            let guest_memory = self.guest_memory.as_ref().unwrap().clone();
-
-            let epoll_config = epoll_context.allocate_tokens_for_virtio_device(
-                TYPE_NET,
-                &cfg.iface_id,
-                NET_EVENTS_COUNT,
-            );
+            let epoll_config = builder
+                .inner_mut()
+                .epoll_context_mut()
+                .allocate_tokens_for_virtio_device(TYPE_NET, &cfg.iface_id, NET_EVENTS_COUNT);
 
             let allow_mmds_requests = cfg.allow_mmds_requests();
 
@@ -226,55 +231,48 @@ impl VmmController {
                 .map_err(CreateNetDevice)?,
             );
 
-            mmio_devices.push((
+            // Unwrap is ok to use because the guest memory is configured.
+            builder.attach_device(
                 cfg.iface_id.clone(),
-                MmioDevice::new(guest_memory, net_box).map_err(|e| {
-                    RegisterMMIODevice(super::device_manager::mmio::Error::CreateMmioDevice(e))
-                })?,
-            ));
+                MmioDevice::new(builder.inner().guest_memory().unwrap().clone(), net_box).map_err(
+                    |e| RegisterMMIODevice(super::device_manager::mmio::Error::CreateMmioDevice(e)),
+                )?,
+            );
         }
         Ok(())
     }
 
-    fn append_vsock_device(
+    fn attach_vsock_device(
         &mut self,
-        mmio_devices: &mut Vec<(String, MmioDevice)>,
+        builder: &mut VmmBuilder,
     ) -> result::Result<(), StartMicrovmError> {
-        let kernel_config = self
-            .kernel_config
-            .as_mut()
-            .ok_or(StartMicrovmError::MissingKernelConfig)?;
-
         if let Some(cfg) = &self.device_configs.vsock {
-            // Unwraps are safe as both options shouldn't be None when this method is called.
-            let epoll_context = self.epoll_context.as_mut().unwrap();
-            let guest_memory = self.guest_memory.as_ref().unwrap().clone();
-
             let backend = devices::virtio::vsock::VsockUnixBackend::new(
                 u64::from(cfg.guest_cid),
                 cfg.uds_path.clone(),
             )
             .map_err(StartMicrovmError::CreateVsockBackend)?;
 
-            let epoll_config = epoll_context.allocate_tokens_for_virtio_device(
-                TYPE_VSOCK,
-                &cfg.vsock_id,
-                VSOCK_EVENTS_COUNT,
-            );
+            let epoll_config = builder
+                .inner_mut()
+                .epoll_context_mut()
+                .allocate_tokens_for_virtio_device(TYPE_VSOCK, &cfg.vsock_id, VSOCK_EVENTS_COUNT);
 
             let vsock_box = Box::new(
                 devices::virtio::Vsock::new(u64::from(cfg.guest_cid), epoll_config, backend)
                     .map_err(StartMicrovmError::CreateVsockDevice)?,
             );
 
-            mmio_devices.push((
+            // Unwrap is ok to use because the guest memory is configured.
+            builder.attach_device(
                 cfg.vsock_id.clone(),
-                MmioDevice::new(guest_memory, vsock_box).map_err(|e| {
-                    StartMicrovmError::RegisterMMIODevice(
-                        super::device_manager::mmio::Error::CreateMmioDevice(e),
-                    )
-                })?,
-            ));
+                MmioDevice::new(builder.inner().guest_memory().unwrap().clone(), vsock_box)
+                    .map_err(|e| {
+                        StartMicrovmError::RegisterMMIODevice(
+                            super::device_manager::mmio::Error::CreateMmioDevice(e),
+                        )
+                    })?,
+            );
         }
         Ok(())
     }
@@ -580,17 +578,12 @@ impl VmmController {
     /// Starts a microVM based on the current configuration.
     pub fn start_microvm(&mut self) -> UserResult {
         self.init_guest_memory()?;
-        // Adding devices to the vec first, because they require self.kernel_config which
-        // is subsequently take()-en.
-        let mut devices = Vec::new();
-        self.append_block_devices(&mut devices)?;
-        self.append_net_devices(&mut devices)?;
-        self.append_vsock_device(&mut devices)?;
 
         let epoll_context = self.epoll_context.take().expect("epoll_context");
         let kernel_config = self.kernel_config.take().expect("kernel_config");
 
-        let vmm = Vmm::spawn(
+        // TODO: remove expect
+        let mut builder = VmmBuilder::new(
             epoll_context,
             // TODO: Unwrap should not fail because first line in this function. Still, should
             // make this prettier.
@@ -599,10 +592,14 @@ impl VmmController {
             self.vm_config.clone(),
             self.shared_info.clone(),
             self.seccomp_level,
-            devices,
-        )?;
+        )
+        .expect("failed to create vmm builder");
 
-        self.vmm = Some(vmm);
+        self.attach_block_devices(&mut builder)?;
+        self.attach_net_devices(&mut builder)?;
+        self.attach_vsock_device(&mut builder)?;
+
+        self.vmm = Some(builder.run()?);
         self.instance_initialized = true;
 
         Ok(())
@@ -779,6 +776,7 @@ impl VmmController {
     }
 }
 
+/*
 #[cfg(test)]
 mod tests {
     extern crate tempfile;
@@ -945,7 +943,7 @@ mod tests {
 
             // Test that creating a new block device returns the correct output.
             assert!(ctrl.insert_block_device(root_block_device.clone()).is_ok());
-            assert!(ctrl.append_block_devices(&mut device_vec).is_ok());
+            assert!(ctrl.attach_block_devices(&mut device_vec).is_ok());
             assert!(ctrl.kernel_cmdline().as_str().contains("root=/dev/vda rw"));
         }
 
@@ -965,7 +963,7 @@ mod tests {
 
             // Test that creating a new block device returns the correct output.
             assert!(ctrl.insert_block_device(root_block_device.clone()).is_ok());
-            assert!(ctrl.append_block_devices(&mut device_vec).is_ok());
+            assert!(ctrl.attach_block_devices(&mut device_vec).is_ok());
             assert!(ctrl
                 .kernel_cmdline()
                 .as_str()
@@ -991,7 +989,7 @@ mod tests {
                 .insert_block_device(non_root_block_device.clone())
                 .is_ok());
 
-            assert!(ctrl.append_block_devices(&mut device_vec).is_ok());
+            assert!(ctrl.attach_block_devices(&mut device_vec).is_ok());
             // Test that kernel commandline does not contain either /dev/vda or PARTUUID.
             assert!(!ctrl.kernel_cmdline().as_str().contains("root=PARTUUID="));
             assert!(!ctrl.kernel_cmdline().as_str().contains("root=/dev/vda"));
@@ -1008,18 +1006,17 @@ mod tests {
                 .set_block_device_path("not_root".to_string(), String::from("dummy_path"))
                 .is_err());
 
-            /*
-            vmm.set_instance_state(InstanceState::Running);
-            // Test updating the block device path, after instance start.
-            let path = String::from(new_block.path().to_path_buf().to_str().unwrap());
-            match vmm.set_block_device_path("not_root".to_string(), path) {
-                Err(VmmActionError::DriveConfig(ErrorKind::User, DriveError::EpollHandlerNotFound)) => {}
-                Err(e) => panic!("Unexpected error: {:?}", e),
-                Ok(_) => {
-                    panic!("Updating block device path shouldn't be possible without an epoll handler.")
-                }
-            }
-            */
+//            vmm.set_instance_state(InstanceState::Running);
+//            // Test updating the block device path, after instance start.
+//            let path = String::from(new_block.path().to_path_buf().to_str().unwrap());
+//            match vmm.set_block_device_path("not_root".to_string(), path) {
+//                Err(VmmActionError::DriveConfig(ErrorKind::User, DriveError::EpollHandlerNotFound)) => {}
+//                Err(e) => panic!("Unexpected error: {:?}", e),
+//                Ok(_) => {
+//                    panic!("Updating block device path shouldn't be possible without an epoll handler.")
+//                }
+//            }
         }
     }
 }
+*/

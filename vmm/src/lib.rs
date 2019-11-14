@@ -396,6 +396,167 @@ pub struct VmmConfig {
     vsock_device: Option<VsockDeviceConfig>,
 }
 
+/// Helps build a Vmm.
+pub struct VmmBuilder {
+    vmm: Vmm,
+}
+
+impl VmmBuilder {
+    /// Create a new VmmBuilder.
+    pub fn new(
+        mut epoll_context: EpollContext,
+        guest_memory: GuestMemory,
+        kernel_config: KernelConfig,
+        vm_config: VmConfig,
+        shared_info: Arc<RwLock<InstanceInfo>>,
+        seccomp_level: u32,
+    ) -> Result<Self> {
+        let write_metrics_event_fd =
+            TimerFd::new_custom(ClockId::Monotonic, true, true).map_err(Error::TimerFd)?;
+
+        epoll_context
+            .add_epollin_event(
+                // non-blocking & close on exec
+                &write_metrics_event_fd,
+                EpollDispatch::WriteMetrics,
+            )
+            .expect("Cannot add write metrics TimerFd to epoll.");
+
+        let kvm = KvmContext::new().map_err(Error::KvmContext)?;
+        let vm = Vm::new(kvm.fd()).map_err(Error::Vm)?;
+
+        let device_configs = DeviceConfigs::new(
+            BlockDeviceConfigs::new(),
+            NetworkInterfaceConfigs::new(),
+            None,
+        );
+
+        let mut vmm = Vmm {
+            kvm,
+            vm_config,
+            shared_info,
+            stdin_handle: io::stdin(),
+            guest_memory: Some(guest_memory),
+            kernel_config: Some(kernel_config),
+            vcpus_handles: vec![],
+            exit_evt: None,
+            vm,
+            mmio_device_manager: None,
+            #[cfg(target_arch = "x86_64")]
+            pio_device_manager: PortIODeviceManager::new().map_err(Error::CreateLegacyDevice)?,
+            device_configs,
+            epoll_context,
+            write_metrics_event_fd,
+            seccomp_level,
+        };
+
+        vmm.init_guest_memory().map_err(Error::StartMicrovm)?;
+        vmm.init_mmio_device_manager()
+            .map_err(Error::StartMicrovm)?;
+
+        Ok(VmmBuilder { vmm })
+    }
+
+    /// Adds a MmioDevice.
+    pub fn attach_device(
+        &mut self,
+        id: String,
+        device: MmioDevice,
+    ) -> result::Result<(), StartMicrovmError> {
+        // Unwrap is safe as we've just created the MMIO device manager.
+        let device_manager = self.vmm.mmio_device_manager.as_mut().unwrap();
+        // The unwrap is safe because the kernel config is always present when spawning.
+        let cmdline = &mut self.vmm.kernel_config.as_mut().unwrap().cmdline;
+
+        // TODO: we currently map into StartMicrovmError::RegisterBlockDevice for all
+        // devices at the end of device_manager.register_mmio_device.
+        let type_id = device.device().device_type();
+        device_manager
+            .register_mmio_device(self.vmm.vm.fd(), device, cmdline, type_id, id.as_str())
+            .map_err(StartMicrovmError::RegisterBlockDevice)?;
+
+        Ok(())
+    }
+
+    /// Start running and return the Vmm.
+    pub fn run(mut self) -> result::Result<Vmm, VmmActionError> {
+        let request_ts = TimestampUs::default();
+
+        // ***** initiailly copied things from start_microvm
+
+        // Use expect() to crash if the other thread poisoned this lock.
+        self.vmm.shared_info
+            .write()
+            .expect("Failed to start microVM because shared info couldn't be written due to poisoned lock")
+            .state = InstanceState::Starting;
+
+        let vcpus;
+
+        // For x86_64 we need to create the interrupt controller before calling `KVM_CREATE_VCPUS`
+        // while on aarch64 we need to do it the other way around.
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.vmm.setup_interrupt_controller()?;
+
+            self.vmm.attach_legacy_devices()?;
+
+            let entry_addr = self.vmm.load_kernel()?;
+            vcpus = self.vmm.create_vcpus(entry_addr, request_ts)?;
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            let entry_addr = self.load_kernel()?;
+            vcpus = self.create_vcpus(entry_addr, request_ts)?;
+
+            self.setup_interrupt_controller()?;
+            self.attach_virtio_devices()?;
+            self.attach_legacy_devices()?;
+        }
+
+        self.vmm.configure_system(vcpus.as_slice())?;
+
+        self.vmm.register_events()?;
+
+        self.vmm.start_vcpus(vcpus)?;
+
+        // Use expect() to crash if the other thread poisoned this lock.
+        self.vmm.shared_info
+            .write()
+            .expect("Failed to start microVM because shared info couldn't be written due to poisoned lock")
+            .state = InstanceState::Running;
+
+        // Arm the log write timer.
+        // TODO: the timer does not stop on InstanceStop.
+        let timer_state = TimerState::Periodic {
+            current: Duration::from_secs(WRITE_METRICS_PERIOD_SECONDS),
+            interval: Duration::from_secs(WRITE_METRICS_PERIOD_SECONDS),
+        };
+        self.vmm
+            .write_metrics_event_fd
+            .set_state(timer_state, SetTimeFlags::Default);
+
+        // Log the metrics straight away to check the process startup time.
+        if LOGGER.log_metrics().is_err() {
+            METRICS.logger.missed_metrics_count.inc();
+        }
+
+        // ***** end of copied things
+
+        Ok(self.vmm)
+    }
+
+    /// Returns a borrowed handle to the inner Vmm.
+    pub fn inner(&self) -> &Vmm {
+        &self.vmm
+    }
+
+    /// Returns a mutable handle to the inner Vmm.
+    pub fn inner_mut(&mut self) -> &mut Vmm {
+        &mut self.vmm
+    }
+}
+
 /// Contains the state and associated methods required for the Firecracker VMM.
 pub struct Vmm {
     kvm: KvmContext,
@@ -429,145 +590,6 @@ pub struct Vmm {
 }
 
 impl Vmm {
-    // TODO: get rid of expects!!!!
-    /// Spawn a Vmm.
-    pub fn spawn(
-        mut epoll_context: EpollContext,
-        guest_memory: GuestMemory,
-        kernel_config: KernelConfig,
-        vm_config: VmConfig,
-        shared_info: Arc<RwLock<InstanceInfo>>,
-        seccomp_level: u32,
-        mmio_devices: Vec<(String, MmioDevice)>,
-    ) -> result::Result<Self, VmmActionError> {
-        // let write_metrics_event_fd =
-        //    TimerFd::new_custom(ClockId::Monotonic, true, true).map_err(Error::TimerFd)?;
-        let write_metrics_event_fd =
-            TimerFd::new_custom(ClockId::Monotonic, true, true).expect("Error::TimerFd");
-
-        epoll_context
-            .add_epollin_event(
-                // non-blocking & close on exec
-                &write_metrics_event_fd,
-                EpollDispatch::WriteMetrics,
-            )
-            .expect("Cannot add write metrics TimerFd to epoll.");
-
-        // let kvm = KvmContext::new().map_err(Error::KvmContext)?;
-        // let vm = Vm::new(kvm.fd()).map_err(Error::Vm)?;
-        let kvm = KvmContext::new().expect("Error::KvmContext");
-        let vm = Vm::new(kvm.fd()).expect("Error::Vm");
-
-        let device_configs = DeviceConfigs::new(
-            BlockDeviceConfigs::new(),
-            NetworkInterfaceConfigs::new(),
-            None,
-        );
-
-        let mut vmm = Vmm {
-            kvm,
-            vm_config,
-            shared_info,
-            stdin_handle: io::stdin(),
-            guest_memory: Some(guest_memory),
-            kernel_config: Some(kernel_config),
-            vcpus_handles: vec![],
-            exit_evt: None,
-            vm,
-            mmio_device_manager: None,
-            #[cfg(target_arch = "x86_64")]
-            // pio_device_manager: PortIODeviceManager::new().map_err(Error::CreateLegacyDevice)?,
-            pio_device_manager: PortIODeviceManager::new().expect("Error::CreateLegacyDevice"),
-            device_configs,
-            epoll_context,
-            write_metrics_event_fd,
-            seccomp_level,
-        };
-
-        let request_ts = TimestampUs::default();
-
-        // ***** copied things from start_microvm
-
-        // Use expect() to crash if the other thread poisoned this lock.
-        vmm.shared_info
-            .write()
-            .expect("Failed to start microVM because shared info couldn't be written due to poisoned lock")
-            .state = InstanceState::Starting;
-
-        vmm.init_guest_memory()?;
-
-        let vcpus;
-
-        // For x86_64 we need to create the interrupt controller before calling `KVM_CREATE_VCPUS`
-        // while on aarch64 we need to do it the other way around.
-        #[cfg(target_arch = "x86_64")]
-        {
-            vmm.setup_interrupt_controller()?;
-
-            vmm.init_mmio_device_manager()?;
-
-            // Unwrap is safe as we've just created the MMIO device manager.
-            let device_manager = vmm.mmio_device_manager.as_mut().unwrap();
-
-            // The unwrap is safe because the kernel config is always present when spawning.
-            let cmdline = &mut vmm.kernel_config.as_mut().unwrap().cmdline;
-
-            // TODO: we currently map into StartMicrovmError::RegisterBlockDevice for all
-            // devices at the end of device_manager.register_mmio_device.
-            for (id, device) in mmio_devices.into_iter() {
-                let type_id = device.device().device_type();
-                device_manager
-                    .register_mmio_device(vmm.vm.fd(), device, cmdline, type_id, id.as_str())
-                    .map_err(StartMicrovmError::RegisterBlockDevice)?;
-            }
-
-            vmm.attach_legacy_devices()?;
-
-            let entry_addr = vmm.load_kernel()?;
-            vcpus = vmm.create_vcpus(entry_addr, request_ts)?;
-        }
-
-        #[cfg(target_arch = "aarch64")]
-        {
-            let entry_addr = self.load_kernel()?;
-            vcpus = self.create_vcpus(entry_addr, request_ts)?;
-
-            self.setup_interrupt_controller()?;
-            self.attach_virtio_devices()?;
-            self.attach_legacy_devices()?;
-        }
-
-        vmm.configure_system(vcpus.as_slice())?;
-
-        vmm.register_events()?;
-
-        vmm.start_vcpus(vcpus)?;
-
-        // Use expect() to crash if the other thread poisoned this lock.
-        vmm.shared_info
-            .write()
-            .expect("Failed to start microVM because shared info couldn't be written due to poisoned lock")
-            .state = InstanceState::Running;
-
-        // Arm the log write timer.
-        // TODO: the timer does not stop on InstanceStop.
-        let timer_state = TimerState::Periodic {
-            current: Duration::from_secs(WRITE_METRICS_PERIOD_SECONDS),
-            interval: Duration::from_secs(WRITE_METRICS_PERIOD_SECONDS),
-        };
-        vmm.write_metrics_event_fd
-            .set_state(timer_state, SetTimeFlags::Default);
-
-        // Log the metrics straight away to check the process startup time.
-        if LOGGER.log_metrics().is_err() {
-            METRICS.logger.missed_metrics_count.inc();
-        }
-
-        // ***** end of copied things
-
-        Ok(vmm)
-    }
-
     /// Returns the VmConfig of this Vmm.
     pub fn vm_config(&self) -> &VmConfig {
         &self.vm_config
