@@ -9,7 +9,7 @@ use std::io;
 use std::result;
 use std::sync::{Arc, Barrier};
 
-use super::TimestampUs;
+use super::{TimestampUs, VcpuConfig};
 use arch;
 #[cfg(target_arch = "aarch64")]
 use arch::aarch64::gic::GICDevice;
@@ -350,18 +350,12 @@ impl Vcpu {
     /// * `kernel_start_addr` - Offset from `guest_mem` at which the kernel starts.
     pub fn configure_x86_64(
         &mut self,
-        machine_config: &VmConfig,
         guest_mem: &GuestMemory,
         kernel_start_addr: GuestAddress,
+        vcpu_config: &VcpuConfig,
     ) -> Result<()> {
-        let cpuid_vm_spec = VmSpec::new(
-            self.id,
-            machine_config
-                .vcpu_count
-                .ok_or(Error::VcpuCountNotInitialized)?,
-            machine_config.ht_enabled.ok_or(Error::HTNotInitialized)?,
-        )
-        .map_err(Error::CpuId)?;
+        let cpuid_vm_spec = VmSpec::new(self.id, vcpu_config.vcpu_count, vcpu_config.ht_enabled)
+            .map_err(Error::CpuId)?;
 
         filter_cpuid(&mut self.cpuid, &cpuid_vm_spec).map_err(|e| {
             METRICS.vcpu.filter_cpuid.inc();
@@ -369,7 +363,7 @@ impl Vcpu {
             Error::CpuId(e)
         })?;
 
-        if let Some(template) = machine_config.cpu_template {
+        if let Some(template) = vcpu_config.cpu_template {
             match template {
                 CpuFeaturesTemplate::T2 => {
                     t2::set_cpuid_entries(&mut self.cpuid, &cpuid_vm_spec).map_err(Error::CpuId)?
@@ -664,24 +658,28 @@ mod tests {
     fn test_configure_vcpu() {
         let (vm, mut vcpu) = setup_vcpu();
 
-        let vm_config = VmConfig::default();
+        let mut vcpu_config = VcpuConfig {
+            vcpu_count: 1,
+            ht_enabled: false,
+            cpu_template: None,
+        };
+
         let vm_mem = vm.get_memory().unwrap();
+
         assert!(vcpu
-            .configure_x86_64(&vm_config, vm_mem, GuestAddress(0))
+            .configure_x86_64(vm_mem, GuestAddress(0), &vcpu_config)
             .is_ok());
 
         // Test configure while using the T2 template.
-        let mut vm_config = VmConfig::default();
-        vm_config.cpu_template = Some(CpuFeaturesTemplate::T2);
+        vcpu_config.cpu_template = Some(CpuFeaturesTemplate::T2);
         assert!(vcpu
-            .configure_x86_64(&vm_config, vm_mem, GuestAddress(0))
+            .configure_x86_64(vm_mem, GuestAddress(0), &vcpu_config)
             .is_ok());
 
         // Test configure while using the C3 template.
-        let mut vm_config = VmConfig::default();
-        vm_config.cpu_template = Some(CpuFeaturesTemplate::C3);
+        vcpu_config.cpu_template = Some(CpuFeaturesTemplate::C3);
         assert!(vcpu
-            .configure_x86_64(&vm_config, vm_mem, GuestAddress(0))
+            .configure_x86_64(vm_mem, GuestAddress(0), &vcpu_config)
             .is_ok());
     }
 

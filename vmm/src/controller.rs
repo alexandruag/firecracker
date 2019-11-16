@@ -6,8 +6,8 @@ use std::result;
 use std::sync::{Arc, RwLock};
 
 use super::{
-    EpollContext, EpollDispatch, ErrorKind, EventLoopExitReason, Result, UserResult, Vmm,
-    VmmActionError, VmmBuilder, VmmConfig, FC_EXIT_CODE_INVALID_JSON,
+    EpollContext, EpollDispatch, ErrorKind, EventLoopExitReason, Result, UserResult, VcpuConfig,
+    Vmm, VmmActionError, VmmBuilder, VmmBuilderConfig, VmmConfig, FC_EXIT_CODE_INVALID_JSON,
 };
 
 use arch::DeviceType;
@@ -104,14 +104,9 @@ impl VmmController {
         if self.device_configs.block.has_root_block_device()
             && !self.device_configs.block.has_partuuid_root()
         {
-            // We rely on check_health function for making sure kernel_config is not None.
-            let kernel_config = builder
-                .inner_mut()
-                .kernel_config
-                .as_mut()
-                .ok_or(MissingKernelConfig)?;
+            let kernel_cmdline = builder.kernel_cmdline_mut();
 
-            kernel_config.cmdline.insert_str("root=/dev/vda")?;
+            kernel_cmdline.insert_str("root=/dev/vda")?;
 
             let flags = if self.device_configs.block.has_read_only_root() {
                 "ro"
@@ -119,7 +114,7 @@ impl VmmController {
                 "rw"
             };
 
-            kernel_config.cmdline.insert_str(flags)?;
+            kernel_cmdline.insert_str(flags)?;
         }
 
         for drive_config in self.device_configs.block.config_list.iter_mut() {
@@ -131,14 +126,9 @@ impl VmmController {
                 .map_err(OpenBlockDevice)?;
 
             if drive_config.is_root_device && drive_config.get_partuuid().is_some() {
-                // We rely on check_health function for making sure kernel_config is not None.
-                let kernel_config = builder
-                    .inner_mut()
-                    .kernel_config
-                    .as_mut()
-                    .ok_or(MissingKernelConfig)?;
+                let kernel_cmdline = builder.kernel_cmdline_mut();
 
-                kernel_config.cmdline.insert_str(format!(
+                kernel_cmdline.insert_str(format!(
                     "root=PARTUUID={}",
                     //The unwrap is safe as we are firstly checking that partuuid is_some().
                     drive_config.get_partuuid().unwrap()
@@ -150,7 +140,7 @@ impl VmmController {
                     "rw"
                 };
 
-                kernel_config.cmdline.insert_str(flags)?;
+                kernel_cmdline.insert_str(flags)?;
             }
 
             let epoll_config = builder
@@ -178,13 +168,11 @@ impl VmmController {
                 .map_err(CreateBlockDevice)?,
             );
 
-            // Unwrap is ok to use because the guest memory is configured.
             builder.attach_device(
                 drive_config.drive_id.clone(),
-                MmioDevice::new(builder.inner().guest_memory().unwrap().clone(), block_box)
-                    .map_err(|e| {
-                        RegisterMMIODevice(super::device_manager::mmio::Error::CreateMmioDevice(e))
-                    })?,
+                MmioDevice::new(builder.inner().guest_memory().clone(), block_box).map_err(
+                    |e| RegisterMMIODevice(super::device_manager::mmio::Error::CreateMmioDevice(e)),
+                )?,
             )?;
         }
 
@@ -231,12 +219,11 @@ impl VmmController {
                 .map_err(CreateNetDevice)?,
             );
 
-            // Unwrap is ok to use because the guest memory is configured.
             builder.attach_device(
                 cfg.iface_id.clone(),
-                MmioDevice::new(builder.inner().guest_memory().unwrap().clone(), net_box).map_err(
-                    |e| RegisterMMIODevice(super::device_manager::mmio::Error::CreateMmioDevice(e)),
-                )?,
+                MmioDevice::new(builder.inner().guest_memory().clone(), net_box).map_err(|e| {
+                    RegisterMMIODevice(super::device_manager::mmio::Error::CreateMmioDevice(e))
+                })?,
             );
         }
         Ok(())
@@ -263,15 +250,15 @@ impl VmmController {
                     .map_err(StartMicrovmError::CreateVsockDevice)?,
             );
 
-            // Unwrap is ok to use because the guest memory is configured.
             builder.attach_device(
                 cfg.vsock_id.clone(),
-                MmioDevice::new(builder.inner().guest_memory().unwrap().clone(), vsock_box)
-                    .map_err(|e| {
+                MmioDevice::new(builder.inner().guest_memory().clone(), vsock_box).map_err(
+                    |e| {
                         StartMicrovmError::RegisterMMIODevice(
                             super::device_manager::mmio::Error::CreateMmioDevice(e),
                         )
-                    })?,
+                    },
+                )?,
             );
         }
         Ok(())
@@ -291,39 +278,6 @@ impl VmmController {
                 Some(GuestMemory::new(&arch_mem_regions).map_err(StartMicrovmError::GuestMemory)?);
         }
         Ok(())
-    }
-
-    fn load_kernel(&mut self) -> std::result::Result<GuestAddress, StartMicrovmError> {
-        use StartMicrovmError::*;
-
-        // This is the easy way out of consuming the value of the kernel_cmdline.
-        let kernel_config = self.kernel_config.as_mut().ok_or(MissingKernelConfig)?;
-
-        // It is safe to unwrap because the VM memory was initialized before in vm.memory_init().
-        let guest_memory = self.guest_memory.as_ref().ok_or(GuestMemory(
-            memory_model::GuestMemoryError::MemoryNotInitialized,
-        ))?;
-
-        let entry_addr = kernel_loader::load_kernel(
-            guest_memory,
-            &mut kernel_config.kernel_file,
-            arch::get_kernel_start(),
-        )
-        .map_err(KernelLoader)?;
-
-        // This is x86_64 specific since on aarch64 the commandline will be specified through the FDT.
-        #[cfg(target_arch = "x86_64")]
-        kernel_loader::load_cmdline(
-            guest_memory,
-            GuestAddress(arch::x86_64::layout::CMDLINE_START),
-            &kernel_config
-                .cmdline
-                .as_cstring()
-                .map_err(LoadCommandline)?,
-        )
-        .map_err(LoadCommandline)?;
-
-        Ok(entry_addr)
     }
 
     fn set_kernel_config(&mut self, kernel_config: KernelConfig) {
@@ -575,25 +529,58 @@ impl VmmController {
         })
     }
 
+    fn load_kernel(&mut self) -> std::result::Result<GuestAddress, StartMicrovmError> {
+        use StartMicrovmError::*;
+
+        // This is the easy way out of consuming the value of the kernel_cmdline.
+        let kernel_config = self.kernel_config.as_mut().ok_or(MissingKernelConfig)?;
+
+        // It is safe to unwrap because the VM memory was initialized before in vm.memory_init().
+        let guest_memory = self.guest_memory.as_ref().ok_or(GuestMemory(
+            memory_model::GuestMemoryError::MemoryNotInitialized,
+        ))?;
+
+        let entry_addr = kernel_loader::load_kernel(
+            guest_memory,
+            &mut kernel_config.kernel_file,
+            arch::get_kernel_start(),
+        )
+        .map_err(KernelLoader)?;
+
+        Ok(entry_addr)
+    }
+
     /// Starts a microVM based on the current configuration.
     pub fn start_microvm(&mut self) -> UserResult {
         self.init_guest_memory()?;
+        let kernel_entry_addr = self.load_kernel()?;
 
         let epoll_context = self.epoll_context.take().expect("epoll_context");
+
+        // TODO: Unwrap should not fail because first line in this function. Still, should
+        // make this prettier.
+        let guest_memory = self.guest_memory.take().unwrap();
         let kernel_config = self.kernel_config.take().expect("kernel_config");
 
+        // The unwraps are ok to use because the values are default intialized if not
+        // also supplied by the user.
+        let vcpu_config = VcpuConfig {
+            vcpu_count: self.vm_config.vcpu_count.clone().unwrap(),
+            ht_enabled: self.vm_config.ht_enabled.clone().unwrap(),
+            cpu_template: self.vm_config.cpu_template.clone(),
+        };
+
+        let builder_config = VmmBuilderConfig {
+            guest_memory,
+            kernel_entry_addr,
+            kernel_cmdline: kernel_config.cmdline,
+            vcpu_config,
+            seccomp_level: self.seccomp_level,
+        };
+
         // TODO: remove expect
-        let mut builder = VmmBuilder::new(
-            epoll_context,
-            // TODO: Unwrap should not fail because first line in this function. Still, should
-            // make this prettier.
-            self.guest_memory.take().unwrap(),
-            kernel_config,
-            self.vm_config.clone(),
-            self.shared_info.clone(),
-            self.seccomp_level,
-        )
-        .expect("failed to create vmm builder");
+        let mut builder = VmmBuilder::new(epoll_context, builder_config, self.shared_info.clone())
+            .expect("failed to create vmm builder");
 
         self.attach_block_devices(&mut builder)?;
         self.attach_net_devices(&mut builder)?;

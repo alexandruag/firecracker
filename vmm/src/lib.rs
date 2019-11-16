@@ -74,7 +74,7 @@ use devices::virtio::{NET_EVENTS_COUNT, TYPE_NET};
 use devices::{BusDevice, DeviceEventT, EpollHandler, RawIOHandler};
 use error::{Error, Result, UserResult};
 use fc_util::time::TimestampUs;
-use kernel::cmdline as kernel_cmdline;
+use kernel::cmdline::Cmdline as KernelCmdline;
 use kernel::loader as kernel_loader;
 use logger::error::LoggerError;
 #[cfg(target_arch = "x86_64")]
@@ -92,7 +92,7 @@ use vmm_config::device_config::DeviceConfigs;
 use vmm_config::drive::{BlockDeviceConfig, BlockDeviceConfigs, DriveError};
 use vmm_config::instance_info::{InstanceInfo, InstanceState};
 use vmm_config::logger::{LoggerConfig, LoggerConfigError, LoggerLevel, LoggerWriter};
-use vmm_config::machine_config::{VmConfig, VmConfigError};
+use vmm_config::machine_config::{CpuFeaturesTemplate, VmConfig, VmConfigError};
 use vmm_config::net::{
     NetworkInterfaceConfig, NetworkInterfaceConfigs, NetworkInterfaceError,
     NetworkInterfaceUpdateConfig,
@@ -396,21 +396,42 @@ pub struct VmmConfig {
     vsock_device: Option<VsockDeviceConfig>,
 }
 
+/// Encapsulates configuration parameters for the guest vCPUS.
+pub struct VcpuConfig {
+    /// Number of guest VCPUs.
+    pub vcpu_count: u8,
+    /// Enable hyperthreading in the CPUID configuration.
+    pub ht_enabled: bool,
+    /// CPUID template to use.
+    pub cpu_template: Option<CpuFeaturesTemplate>,
+}
+
+/// Encapsulates configuration parameters for a `VmmBuilder`.
+pub struct VmmBuilderConfig {
+    /// The guest memory object for this VM.
+    pub guest_memory: GuestMemory,
+    /// Kernel entry address within the guest memory object.
+    pub kernel_entry_addr: GuestAddress,
+    /// Base kernel command line contents.
+    pub kernel_cmdline: KernelCmdline,
+    /// vCPU configuration paramters.
+    pub vcpu_config: VcpuConfig,
+    /// Seccomp filtering level.
+    pub seccomp_level: u32,
+}
+
 /// Helps build a Vmm.
 pub struct VmmBuilder {
     vmm: Vmm,
-    vcpus: Vec<Vcpu>,
+    kernel_entry_addr: GuestAddress,
 }
 
 impl VmmBuilder {
     /// Create a new VmmBuilder.
     pub fn new(
         mut epoll_context: EpollContext,
-        guest_memory: GuestMemory,
-        kernel_config: KernelConfig,
-        vm_config: VmConfig,
+        config: VmmBuilderConfig,
         shared_info: Arc<RwLock<InstanceInfo>>,
-        seccomp_level: u32,
     ) -> Result<Self> {
         let write_metrics_event_fd =
             TimerFd::new_custom(ClockId::Monotonic, true, true).map_err(Error::TimerFd)?;
@@ -426,63 +447,41 @@ impl VmmBuilder {
         let kvm = KvmContext::new().map_err(Error::KvmContext)?;
         let vm = Vm::new(kvm.fd()).map_err(Error::Vm)?;
 
-        let device_configs = DeviceConfigs::new(
-            BlockDeviceConfigs::new(),
-            NetworkInterfaceConfigs::new(),
-            None,
-        );
-
         let mut vmm = Vmm {
             kvm,
-            vm_config,
             shared_info,
             stdin_handle: io::stdin(),
-            guest_memory: Some(guest_memory),
-            kernel_config: Some(kernel_config),
-            vcpus_handles: vec![],
+            guest_memory: config.guest_memory,
+            vcpu_config: config.vcpu_config,
+            kernel_cmdline: config.kernel_cmdline,
+            vcpus_handles: Vec::new(),
             exit_evt: None,
             vm,
             mmio_device_manager: None,
             #[cfg(target_arch = "x86_64")]
             pio_device_manager: PortIODeviceManager::new().map_err(Error::CreateLegacyDevice)?,
-            device_configs,
             epoll_context,
             write_metrics_event_fd,
-            seccomp_level,
+            seccomp_level: config.seccomp_level,
         };
 
         vmm.init_guest_memory().map_err(Error::StartMicrovm)?;
         vmm.init_mmio_device_manager()
             .map_err(Error::StartMicrovm)?;
 
-        // The next part until returning the Vmm builder was necessary at the moment, because
-        // registering IrqFds didn't work until the irqchip setup happened.
-
-        let vcpus;
-
-        // For x86_64 we need to create the interrupt controller before calling `KVM_CREATE_VCPUS`
-        // while on aarch64 we need to do it the other way around.
         #[cfg(target_arch = "x86_64")]
-        {
-            vmm.setup_interrupt_controller()
-                .map_err(Error::StartMicrovm)?;
-            vmm.attach_legacy_devices().map_err(Error::StartMicrovm)?;
-        }
-
-        let entry_addr = vmm.load_kernel().map_err(Error::StartMicrovm)?;
-        let request_ts = TimestampUs::default();
-        vcpus = vmm
-            .create_vcpus(entry_addr, request_ts)
+        vmm.setup_interrupt_controller()
             .map_err(Error::StartMicrovm)?;
 
-        #[cfg(target_arch = "aarch64")]
-        {
-            vmm.setup_interrupt_controller()
-                .map_err(Error::StartMicrovm)?;
-            vmm.attach_legacy_devices().map_err(Error::StartMicrovm)?;
-        }
+        Ok(VmmBuilder {
+            vmm,
+            kernel_entry_addr: config.kernel_entry_addr,
+        })
+    }
 
-        Ok(VmmBuilder { vmm, vcpus })
+    /// Returns a mutable reference to the guest kernel cmdline.
+    pub fn kernel_cmdline_mut(&mut self) -> &mut KernelCmdline {
+        &mut self.vmm.kernel_cmdline
     }
 
     /// Adds a MmioDevice.
@@ -493,12 +492,12 @@ impl VmmBuilder {
     ) -> result::Result<(), StartMicrovmError> {
         // Unwrap is safe as we've just created the MMIO device manager.
         let device_manager = self.vmm.mmio_device_manager.as_mut().unwrap();
-        // The unwrap is safe because the kernel config is always present when spawning.
-        let cmdline = &mut self.vmm.kernel_config.as_mut().unwrap().cmdline;
 
         // TODO: we currently map into StartMicrovmError::RegisterBlockDevice for all
         // devices at the end of device_manager.register_mmio_device.
         let type_id = device.device().device_type();
+        let cmdline = &mut self.vmm.kernel_cmdline;
+
         device_manager
             .register_mmio_device(self.vmm.vm.fd(), device, cmdline, type_id, id.as_str())
             .map_err(StartMicrovmError::RegisterBlockDevice)?;
@@ -508,17 +507,52 @@ impl VmmBuilder {
 
     /// Start running and return the Vmm.
     pub fn run(mut self) -> result::Result<Vmm, VmmActionError> {
+        let request_ts = TimestampUs::default();
+
+        // Write the kernel command line to guest memory. This is x86_64 specific, since on
+        // aarch64 the command line will be specified through the FDT.
+        #[cfg(target_arch = "x86_64")]
+        kernel_loader::load_cmdline(
+            self.vmm.guest_memory(),
+            GuestAddress(arch::x86_64::layout::CMDLINE_START),
+            &self
+                .vmm
+                .kernel_cmdline
+                .as_cstring()
+                .map_err(StartMicrovmError::LoadCommandline)?,
+        )
+        .map_err(StartMicrovmError::LoadCommandline)?;
+
+        // ***** initiailly copied things from start_microvm
+
         // Use expect() to crash if the other thread poisoned this lock.
         self.vmm.shared_info
             .write()
             .expect("Failed to start microVM because shared info couldn't be written due to poisoned lock")
             .state = InstanceState::Starting;
 
-        self.vmm.configure_system(self.vcpus.as_slice())?;
+        let vcpus;
+
+        // For x86_64 we need to create the interrupt controller before calling `KVM_CREATE_VCPUS`
+        // while on aarch64 we need to do it the other way around.
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.vmm.attach_legacy_devices()?;
+        }
+
+        vcpus = self.vmm.create_vcpus(self.kernel_entry_addr, request_ts)?;
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            self.vmm.setup_interrupt_controller()?;
+            self.vmm.attach_legacy_devices()?;
+        }
+
+        self.vmm.configure_system(vcpus.as_slice())?;
 
         self.vmm.register_events()?;
 
-        self.vmm.start_vcpus(self.vcpus.split_off(0))?;
+        self.vmm.start_vcpus(vcpus)?;
 
         // Use expect() to crash if the other thread poisoned this lock.
         self.vmm.shared_info
@@ -541,6 +575,8 @@ impl VmmBuilder {
             METRICS.logger.missed_metrics_count.inc();
         }
 
+        // ***** end of copied things
+
         Ok(self.vmm)
     }
 
@@ -559,14 +595,15 @@ impl VmmBuilder {
 pub struct Vmm {
     kvm: KvmContext,
 
-    vm_config: VmConfig,
     shared_info: Arc<RwLock<InstanceInfo>>,
-
     stdin_handle: io::Stdin,
 
     // Guest VM core resources.
-    guest_memory: Option<GuestMemory>,
-    kernel_config: Option<KernelConfig>,
+    guest_memory: GuestMemory,
+    vcpu_config: VcpuConfig,
+
+    kernel_cmdline: KernelCmdline,
+
     vcpus_handles: Vec<thread::JoinHandle<()>>,
     exit_evt: Option<EventFd>,
     vm: Vm,
@@ -576,23 +613,14 @@ pub struct Vmm {
     #[cfg(target_arch = "x86_64")]
     pio_device_manager: PortIODeviceManager,
 
-    // Device configurations.
-    device_configs: DeviceConfigs,
-
     epoll_context: EpollContext,
 
     write_metrics_event_fd: TimerFd,
-
     // The level of seccomp filtering used. Seccomp filters are loaded before executing guest code.
     seccomp_level: u32,
 }
 
 impl Vmm {
-    /// Returns the VmConfig of this Vmm.
-    pub fn vm_config(&self) -> &VmConfig {
-        &self.vm_config
-    }
-
     /// Returns a borrowed handle for the inner `EpollContext` object.
     pub fn epoll_context(&self) -> &EpollContext {
         &self.epoll_context
@@ -613,10 +641,6 @@ impl Vmm {
             .as_ref()
             .unwrap()
             .get_device(device_type, device_id)
-    }
-
-    fn set_kernel_config(&mut self, kernel_config: KernelConfig) {
-        self.kernel_config = Some(kernel_config);
     }
 
     /// Force writes metrics.
@@ -646,47 +670,19 @@ impl Vmm {
     }
 
     fn init_guest_memory(&mut self) -> std::result::Result<(), StartMicrovmError> {
-        if self.guest_memory().is_none() {
-            let mem_size = self
-                .vm_config
-                .mem_size_mib
-                .ok_or(StartMicrovmError::GuestMemory(
-                    memory_model::GuestMemoryError::MemoryNotInitialized,
-                ))?
-                << 20;
-            let arch_mem_regions = arch::arch_memory_regions(mem_size);
-            self.set_guest_memory(
-                GuestMemory::new(&arch_mem_regions).map_err(StartMicrovmError::GuestMemory)?,
-            );
-        }
-
         self.vm
-            .memory_init(
-                self.guest_memory
-                    .clone()
-                    .ok_or(StartMicrovmError::GuestMemory(
-                        memory_model::GuestMemoryError::MemoryNotInitialized,
-                    ))?,
-                &self.kvm,
-            )
+            .memory_init(self.guest_memory().clone(), &self.kvm)
             .map_err(StartMicrovmError::ConfigureVm)?;
         Ok(())
     }
 
     fn init_mmio_device_manager(&mut self) -> std::result::Result<(), StartMicrovmError> {
         if self.mmio_device_manager.is_none() {
-            let guest_mem = self
-                .guest_memory
-                .clone()
-                .ok_or(StartMicrovmError::GuestMemory(
-                    memory_model::GuestMemoryError::MemoryNotInitialized,
-                ))?;
-
             // Instantiate the MMIO device manager.
             // 'mmio_base' address has to be an address which is protected by the kernel
             // and is architectural specific.
             let device_manager = MMIODeviceManager::new(
-                guest_mem.clone(),
+                self.guest_memory().clone(),
                 &mut (arch::get_reserved_mem_addr() as u64),
                 (arch::IRQ_BASE, arch::IRQ_MAX),
             );
@@ -794,10 +790,7 @@ impl Vmm {
         entry_addr: GuestAddress,
         request_ts: TimestampUs,
     ) -> std::result::Result<Vec<Vcpu>, StartMicrovmError> {
-        let vcpu_count = self
-            .vm_config
-            .vcpu_count
-            .ok_or(StartMicrovmError::VcpusNotConfigured)?;
+        let vcpu_count = self.vcpu_config.vcpu_count;
 
         let vm_memory = self.vm.get_memory().ok_or(StartMicrovmError::GuestMemory(
             memory_model::GuestMemoryError::MemoryNotInitialized,
@@ -818,7 +811,7 @@ impl Vmm {
                 )
                 .map_err(StartMicrovmError::Vcpu)?;
 
-                vcpu.configure_x86_64(&self.vm_config, vm_memory, entry_addr)
+                vcpu.configure_x86_64(vm_memory, entry_addr, &self.vcpu_config)
                     .map_err(StartMicrovmError::VcpuConfigure)?;
             }
             #[cfg(target_arch = "aarch64")]
@@ -836,17 +829,7 @@ impl Vmm {
     }
 
     fn start_vcpus(&mut self, mut vcpus: Vec<Vcpu>) -> std::result::Result<(), StartMicrovmError> {
-        // vm_config has a default value for vcpu_count.
-        let vcpu_count = self
-            .vm_config
-            .vcpu_count
-            .ok_or(StartMicrovmError::VcpusNotConfigured)?;
-
-        assert_eq!(
-            vcpus.len(),
-            vcpu_count as usize,
-            "The number of vCPU fds is corrupted!"
-        );
+        let vcpu_count = vcpus.len();
 
         self.vcpus_handles.reserve(vcpu_count as usize);
 
@@ -902,58 +885,21 @@ impl Vmm {
         Ok(())
     }
 
-    fn load_kernel(&mut self) -> std::result::Result<GuestAddress, StartMicrovmError> {
-        use StartMicrovmError::*;
-
-        // This is the easy way out of consuming the value of the kernel_cmdline.
-        let kernel_config = self.kernel_config.as_mut().ok_or(MissingKernelConfig)?;
-
-        // It is safe to unwrap because the VM memory was initialized before in vm.memory_init().
-        let vm_memory = self.vm.get_memory().ok_or(GuestMemory(
-            memory_model::GuestMemoryError::MemoryNotInitialized,
-        ))?;
-
-        let entry_addr = kernel_loader::load_kernel(
-            vm_memory,
-            &mut kernel_config.kernel_file,
-            arch::get_kernel_start(),
-        )
-        .map_err(KernelLoader)?;
-
-        // This is x86_64 specific since on aarch64 the commandline will be specified through the FDT.
-        #[cfg(target_arch = "x86_64")]
-        kernel_loader::load_cmdline(
-            vm_memory,
-            GuestAddress(arch::x86_64::layout::CMDLINE_START),
-            &kernel_config
-                .cmdline
-                .as_cstring()
-                .map_err(LoadCommandline)?,
-        )
-        .map_err(LoadCommandline)?;
-
-        Ok(entry_addr)
-    }
-
     #[allow(unused_variables)]
     fn configure_system(&self, vcpus: &[Vcpu]) -> std::result::Result<(), StartMicrovmError> {
         use StartMicrovmError::*;
 
-        let kernel_config = self.kernel_config.as_ref().ok_or(MissingKernelConfig)?;
-
         let vm_memory = self.vm.get_memory().ok_or(GuestMemory(
             memory_model::GuestMemoryError::MemoryNotInitialized,
         ))?;
 
-        // The vcpu_count has a default value. We shouldn't have gotten to this point without
-        // having set the vcpu count.
-        let vcpu_count = self.vm_config.vcpu_count.ok_or(VcpusNotConfigured)?;
+        let vcpu_count = vcpus.len() as u8;
 
         #[cfg(target_arch = "x86_64")]
         arch::x86_64::configure_system(
             vm_memory,
             GuestAddress(arch::x86_64::layout::CMDLINE_START),
-            kernel_config.cmdline.len() + 1,
+            self.kernel_cmdline.len() + 1,
             vcpu_count,
         )
         .map_err(ConfigureSystem)?;
@@ -1013,14 +959,9 @@ impl Vmm {
         Ok(())
     }
 
-    /// Set the guest memory based on a pre-constructed `GuestMemory` object.
-    pub fn set_guest_memory(&mut self, guest_memory: GuestMemory) {
-        self.guest_memory = Some(guest_memory);
-    }
-
     /// Returns a reference to the inner `GuestMemory` object if present, or `None` otherwise.
-    pub fn guest_memory(&self) -> Option<&GuestMemory> {
-        self.guest_memory.as_ref()
+    pub fn guest_memory(&self) -> &GuestMemory {
+        &self.guest_memory
     }
 
     /// Injects CTRL+ALT+DEL keystroke combo in the i8042 device.
@@ -1171,8 +1112,7 @@ impl Vmm {
             };
 
         self.guest_memory()
-            .map(|ref mem| mem.map_and_fold(0, dirty_pages_in_region, std::ops::Add::add))
-            .unwrap_or(0)
+            .map_and_fold(0, dirty_pages_in_region, std::ops::Add::add)
     }
 
     fn log_boot_time(t0_ts: &TimestampUs) {
@@ -1198,6 +1138,10 @@ impl Vmm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    extern crate tempfile;
+
+    use self::tempfile::{tempfile, NamedTempFile};
 
     impl Vmm {
         // Left around here because it's called by tests::create_vmm_object in the device_manager
@@ -1225,22 +1169,25 @@ mod tests {
                 )
                 .expect("Cannot add write metrics TimerFd to epoll.");
 
-            let device_configs = DeviceConfigs::new(
-                BlockDeviceConfigs::new(),
-                NetworkInterfaceConfigs::new(),
-                None,
-            );
-
             let kvm = KvmContext::new().map_err(Error::KvmContext)?;
             let vm = Vm::new(kvm.fd()).map_err(Error::Vm)?;
 
+            let guest_memory = GuestMemory::new(&[(GuestAddress(0), 0x10000)])
+                .expect("Could not create guest memory object");
+
+            let mut vcpu_config = VcpuConfig {
+                vcpu_count: 1,
+                ht_enabled: false,
+                cpu_template: None,
+            };
+
             Ok(Vmm {
                 kvm,
-                vm_config: VmConfig::default(),
                 shared_info,
                 stdin_handle: io::stdin(),
-                guest_memory: None,
-                kernel_config: None,
+                guest_memory,
+                vcpu_config,
+                kernel_cmdline: KernelCmdline::new(1000),
                 vcpus_handles: vec![],
                 exit_evt: None,
                 vm,
@@ -1248,7 +1195,6 @@ mod tests {
                 #[cfg(target_arch = "x86_64")]
                 pio_device_manager: PortIODeviceManager::new()
                     .map_err(Error::CreateLegacyDevice)?,
-                device_configs,
                 epoll_context,
                 write_metrics_event_fd,
                 seccomp_level,
@@ -1276,7 +1222,6 @@ mod tests {
     use std::io::BufReader;
     use std::sync::atomic::AtomicUsize;
 
-    use self::tempfile::NamedTempFile;
     use arch::DeviceType;
     use devices::virtio::{ActivateResult, MmioDevice, Queue};
     use dumbo::MacAddr;

@@ -16,7 +16,7 @@ use arch::DeviceType;
 use devices;
 use devices::virtio::TYPE_BLOCK;
 use devices::{BusDevice, RawIOHandler};
-use kernel_cmdline;
+use kernel::cmdline as kernel_cmdline;
 use kvm_ioctls::{IoEventAddress, VmFd};
 use memory_model::GuestMemory;
 
@@ -345,7 +345,6 @@ mod tests {
     use super::*;
     use arch;
     use devices::virtio::{ActivateResult, VirtioDevice, TYPE_BLOCK};
-    use kernel_cmdline;
     use memory_model::{GuestAddress, GuestMemory};
     use std::sync::atomic::AtomicUsize;
     use std::sync::{Arc, RwLock};
