@@ -12,6 +12,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
 
+#[cfg(target_arch = "x86_64")]
 use self::serde_json::Value;
 
 type Result<T> = std::result::Result<T, std::io::Error>;
@@ -104,6 +105,7 @@ fn default_level() -> LoggerLevel {
     LoggerLevel::Warning
 }
 
+#[cfg(target_arch = "x86_64")]
 fn default_log_options() -> Value {
     Value::Array(vec![])
 }

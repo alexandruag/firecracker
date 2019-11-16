@@ -69,6 +69,7 @@ use devices::{BusDevice, DeviceEventT, EpollHandler, RawIOHandler};
 use error::{Error, Result, UserResult};
 use fc_util::time::TimestampUs;
 use kernel::cmdline::Cmdline as KernelCmdline;
+#[cfg(target_arch = "x86_64")]
 use kernel::loader as kernel_loader;
 use logger::error::LoggerError;
 #[cfg(target_arch = "x86_64")]
@@ -76,8 +77,6 @@ use logger::LogOption;
 use logger::{Metric, LOGGER, METRICS};
 use memory_model::{GuestAddress, GuestMemory};
 use net_util::TapError;
-#[cfg(target_arch = "aarch64")]
-use serde_json::Value;
 use sys_util::{EventFd, Terminal};
 use vmm_config::boot_source::{BootSourceConfig, BootSourceConfigError};
 use vmm_config::drive::{BlockDeviceConfig, DriveError};
@@ -411,7 +410,7 @@ pub struct VmmBuilderConfig {
 /// Helps build a Vmm.
 pub struct VmmBuilder {
     vmm: Vmm,
-    kernel_entry_addr: GuestAddress,
+    vcpus: Vec<Vcpu>,
 }
 
 impl VmmBuilder {
@@ -433,10 +432,23 @@ impl VmmBuilder {
             .expect("Cannot add write metrics TimerFd to epoll.");
 
         let kvm = KvmContext::new().map_err(Error::KvmContext)?;
-        let vm = Vm::new(kvm.fd()).map_err(Error::Vm)?;
+
+        let mut vm = Vm::new(kvm.fd()).map_err(Error::Vm)?;
+
+        vm.memory_init(config.guest_memory.clone(), &kvm)
+            .map_err(StartMicrovmError::ConfigureVm)
+            .map_err(Error::StartMicrovm)?;
+
+        // Instantiate the MMIO device manager.
+        // 'mmio_base' address has to be an address which is protected by the kernel
+        // and is architectural specific.
+        let mmio_device_manager = MMIODeviceManager::new(
+            config.guest_memory.clone(),
+            &mut (arch::get_reserved_mem_addr() as u64),
+            (arch::IRQ_BASE, arch::IRQ_MAX),
+        );
 
         let mut vmm = Vmm {
-            kvm,
             shared_info,
             stdin_handle: io::stdin(),
             guest_memory: config.guest_memory,
@@ -445,7 +457,7 @@ impl VmmBuilder {
             vcpus_handles: Vec::new(),
             exit_evt: None,
             vm,
-            mmio_device_manager: None,
+            mmio_device_manager,
             #[cfg(target_arch = "x86_64")]
             pio_device_manager: PortIODeviceManager::new().map_err(Error::CreateLegacyDevice)?,
             epoll_context,
@@ -453,18 +465,34 @@ impl VmmBuilder {
             seccomp_level: config.seccomp_level,
         };
 
-        vmm.init_guest_memory().map_err(Error::StartMicrovm)?;
-        vmm.init_mmio_device_manager()
-            .map_err(Error::StartMicrovm)?;
-
+        // For x86_64 we need to create the interrupt controller before calling `KVM_CREATE_VCPUS`
+        // while on aarch64 we need to do it the other way around.
         #[cfg(target_arch = "x86_64")]
-        vmm.setup_interrupt_controller()
+        {
+            vmm.setup_interrupt_controller()
+                .map_err(Error::StartMicrovm)?;
+            // This call has to be here after setting up the irqchip, because
+            // we set up some irqfd inside for some reason.
+            vmm.attach_legacy_devices().map_err(Error::StartMicrovm)?;
+        }
+
+        // This was supposed to be the timestamp when the start command is recevied. Having this
+        // here just to create the vcpu; going forward the req timestamp will prob be somehow
+        // decoupled from the creation. At this point it's still fine because we create the
+        // builder and run the Vmm when the StartMicrovm request is received by the controller.
+        let request_ts = TimestampUs::default();
+        let vcpus = vmm
+            .create_vcpus(config.kernel_entry_addr, request_ts)
             .map_err(Error::StartMicrovm)?;
 
-        Ok(VmmBuilder {
-            vmm,
-            kernel_entry_addr: config.kernel_entry_addr,
-        })
+        #[cfg(target_arch = "aarch64")]
+        {
+            vmm.setup_interrupt_controller()
+                .map_err(Error::StartMicrovm)?;
+            vmm.attach_legacy_devices().map_err(Error::StartMicrovm)?;
+        }
+
+        Ok(VmmBuilder { vmm, vcpus })
     }
 
     /// Returns a mutable reference to the guest kernel cmdline.
@@ -478,15 +506,13 @@ impl VmmBuilder {
         id: String,
         device: MmioDevice,
     ) -> result::Result<(), StartMicrovmError> {
-        // Unwrap is safe as we've just created the MMIO device manager.
-        let device_manager = self.vmm.mmio_device_manager.as_mut().unwrap();
-
         // TODO: we currently map into StartMicrovmError::RegisterBlockDevice for all
         // devices at the end of device_manager.register_mmio_device.
         let type_id = device.device().device_type();
         let cmdline = &mut self.vmm.kernel_cmdline;
 
-        device_manager
+        self.vmm
+            .mmio_device_manager
             .register_mmio_device(self.vmm.vm.fd(), device, cmdline, type_id, id.as_str())
             .map_err(StartMicrovmError::RegisterBlockDevice)?;
 
@@ -495,8 +521,6 @@ impl VmmBuilder {
 
     /// Start running and return the Vmm.
     pub fn run(mut self) -> result::Result<Vmm, VmmActionError> {
-        let request_ts = TimestampUs::default();
-
         // Write the kernel command line to guest memory. This is x86_64 specific, since on
         // aarch64 the command line will be specified through the FDT.
         #[cfg(target_arch = "x86_64")]
@@ -519,28 +543,11 @@ impl VmmBuilder {
             .expect("Failed to start microVM because shared info couldn't be written due to poisoned lock")
             .state = InstanceState::Starting;
 
-        let vcpus;
-
-        // For x86_64 we need to create the interrupt controller before calling `KVM_CREATE_VCPUS`
-        // while on aarch64 we need to do it the other way around.
-        #[cfg(target_arch = "x86_64")]
-        {
-            self.vmm.attach_legacy_devices()?;
-        }
-
-        vcpus = self.vmm.create_vcpus(self.kernel_entry_addr, request_ts)?;
-
-        #[cfg(target_arch = "aarch64")]
-        {
-            self.vmm.setup_interrupt_controller()?;
-            self.vmm.attach_legacy_devices()?;
-        }
-
-        self.vmm.configure_system(vcpus.as_slice())?;
+        self.vmm.configure_system(self.vcpus.as_slice())?;
 
         self.vmm.register_events()?;
 
-        self.vmm.start_vcpus(vcpus)?;
+        self.vmm.start_vcpus(self.vcpus)?;
 
         // Use expect() to crash if the other thread poisoned this lock.
         self.vmm.shared_info
@@ -581,8 +588,6 @@ impl VmmBuilder {
 
 /// Contains the state and associated methods required for the Firecracker VMM.
 pub struct Vmm {
-    kvm: KvmContext,
-
     shared_info: Arc<RwLock<InstanceInfo>>,
     stdin_handle: io::Stdin,
 
@@ -597,7 +602,7 @@ pub struct Vmm {
     vm: Vm,
 
     // Guest VM devices.
-    mmio_device_manager: Option<MMIODeviceManager>,
+    mmio_device_manager: MMIODeviceManager,
     #[cfg(target_arch = "x86_64")]
     pio_device_manager: PortIODeviceManager,
 
@@ -625,10 +630,7 @@ impl Vmm {
         device_type: DeviceType,
         device_id: &str,
     ) -> Option<&Mutex<dyn BusDevice>> {
-        self.mmio_device_manager
-            .as_ref()
-            .unwrap()
-            .get_device(device_type, device_id)
+        self.mmio_device_manager.get_device(device_type, device_id)
     }
 
     /// Force writes metrics.
@@ -657,49 +659,20 @@ impl Vmm {
         LOGGER.log_metrics().map(|_| ())
     }
 
-    fn init_guest_memory(&mut self) -> std::result::Result<(), StartMicrovmError> {
-        self.vm
-            .memory_init(self.guest_memory().clone(), &self.kvm)
-            .map_err(StartMicrovmError::ConfigureVm)?;
-        Ok(())
-    }
-
-    fn init_mmio_device_manager(&mut self) -> std::result::Result<(), StartMicrovmError> {
-        if self.mmio_device_manager.is_none() {
-            // Instantiate the MMIO device manager.
-            // 'mmio_base' address has to be an address which is protected by the kernel
-            // and is architectural specific.
-            let device_manager = MMIODeviceManager::new(
-                self.guest_memory().clone(),
-                &mut (arch::get_reserved_mem_addr() as u64),
-                (arch::IRQ_BASE, arch::IRQ_MAX),
-            );
-            self.mmio_device_manager = Some(device_manager);
-        }
-
-        Ok(())
-    }
-
     #[cfg(target_arch = "x86_64")]
     fn get_serial_device(&self) -> Option<Arc<Mutex<dyn RawIOHandler>>> {
         Some(self.pio_device_manager.stdio_serial.clone())
     }
 
     #[cfg(target_arch = "aarch64")]
-    fn get_serial_device(&self) -> Option<&Arc<Mutex<RawIOHandler>>> {
+    fn get_serial_device(&self) -> Option<&Arc<Mutex<dyn RawIOHandler>>> {
         self.mmio_device_manager
-            .as_ref()
-            .unwrap()
             .get_raw_io_device(DeviceType::Serial)
     }
 
     #[cfg(target_arch = "aarch64")]
     fn get_mmio_device_info(&self) -> Option<&HashMap<(DeviceType, String), MMIODeviceInfo>> {
-        if let Some(ref device_manager) = self.mmio_device_manager {
-            Some(device_manager.get_device_info())
-        } else {
-            None
-        }
+        Some(self.mmio_device_manager.get_device_info())
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -711,13 +684,8 @@ impl Vmm {
 
     #[cfg(target_arch = "aarch64")]
     fn setup_interrupt_controller(&mut self) -> std::result::Result<(), StartMicrovmError> {
-        let vcpu_count = self
-            .vm_config
-            .vcpu_count
-            .ok_or(StartMicrovmError::VcpusNotConfigured)?;
-
         self.vm
-            .setup_irqchip(vcpu_count)
+            .setup_irqchip(self.vcpu_config.vcpu_count)
             .map_err(StartMicrovmError::ConfigureVm)
     }
 
@@ -748,21 +716,13 @@ impl Vmm {
     fn attach_legacy_devices(&mut self) -> std::result::Result<(), StartMicrovmError> {
         use StartMicrovmError::*;
 
-        self.init_mmio_device_manager()?;
-        // `unwrap` is suitable for this context since this should be called only after the
-        // device manager has been initialized.
-        let device_manager = self.mmio_device_manager.as_mut().unwrap();
-
-        // We rely on check_health function for making sure kernel_config is not None.
-        let kernel_config = self.kernel_config.as_mut().ok_or(MissingKernelConfig)?;
-
-        if kernel_config.cmdline.as_str().contains("console=") {
-            device_manager
-                .register_mmio_serial(self.vm.fd(), &mut kernel_config.cmdline)
+        if self.kernel_cmdline.as_str().contains("console=") {
+            self.mmio_device_manager
+                .register_mmio_serial(self.vm.fd(), &mut self.kernel_cmdline)
                 .map_err(RegisterMMIODevice)?;
         }
 
-        device_manager
+        self.mmio_device_manager
             .register_mmio_rtc(self.vm.fd())
             .map_err(RegisterMMIODevice)?;
 
@@ -847,9 +807,7 @@ impl Vmm {
             // of items of `vcpus` vector.
             let mut vcpu = vcpus.pop().unwrap();
 
-            if let Some(ref mmio_device_manager) = self.mmio_device_manager {
-                vcpu.set_mmio_bus(mmio_device_manager.bus.clone());
-            }
+            vcpu.set_mmio_bus(self.mmio_device_manager.bus.clone());
 
             let seccomp_level = self.seccomp_level;
             self.vcpus_handles.push(
@@ -897,10 +855,7 @@ impl Vmm {
             let vcpu_mpidr = vcpus.into_iter().map(|cpu| cpu.get_mpidr()).collect();
             arch::aarch64::configure_system(
                 vm_memory,
-                &kernel_config
-                    .cmdline
-                    .as_cstring()
-                    .map_err(LoadCommandline)?,
+                &self.kernel_cmdline.as_cstring().map_err(LoadCommandline)?,
                 vcpu_mpidr,
                 self.get_mmio_device_info(),
                 self.vm.get_irqchip(),
@@ -1160,8 +1115,16 @@ mod tests {
                 cpu_template: None,
             };
 
+            // Instantiate the MMIO device manager.
+            // 'mmio_base' address has to be an address which is protected by the kernel
+            // and is architectural specific.
+            let mmio_device_manager = MMIODeviceManager::new(
+                guest_memory.clone(),
+                &mut (arch::get_reserved_mem_addr() as u64),
+                (arch::IRQ_BASE, arch::IRQ_MAX),
+            );
+
             Ok(Vmm {
-                kvm,
                 shared_info,
                 stdin_handle: io::stdin(),
                 guest_memory,
@@ -1170,7 +1133,7 @@ mod tests {
                 vcpus_handles: vec![],
                 exit_evt: None,
                 vm,
-                mmio_device_manager: None,
+                mmio_device_manager,
                 #[cfg(target_arch = "x86_64")]
                 pio_device_manager: PortIODeviceManager::new()
                     .map_err(Error::CreateLegacyDevice)?,
