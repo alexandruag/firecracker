@@ -399,6 +399,7 @@ pub struct VmmConfig {
 /// Helps build a Vmm.
 pub struct VmmBuilder {
     vmm: Vmm,
+    vcpus: Vec<Vcpu>,
 }
 
 impl VmmBuilder {
@@ -454,7 +455,34 @@ impl VmmBuilder {
         vmm.init_mmio_device_manager()
             .map_err(Error::StartMicrovm)?;
 
-        Ok(VmmBuilder { vmm })
+        // The next part until returning the Vmm builder was necessary at the moment, because
+        // registering IrqFds didn't work until the irqchip setup happened.
+
+        let vcpus;
+
+        // For x86_64 we need to create the interrupt controller before calling `KVM_CREATE_VCPUS`
+        // while on aarch64 we need to do it the other way around.
+        #[cfg(target_arch = "x86_64")]
+        {
+            vmm.setup_interrupt_controller()
+                .map_err(Error::StartMicrovm)?;
+            vmm.attach_legacy_devices().map_err(Error::StartMicrovm)?;
+        }
+
+        let entry_addr = vmm.load_kernel().map_err(Error::StartMicrovm)?;
+        let request_ts = TimestampUs::default();
+        vcpus = vmm
+            .create_vcpus(entry_addr, request_ts)
+            .map_err(Error::StartMicrovm)?;
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            vmm.setup_interrupt_controller()
+                .map_err(Error::StartMicrovm)?;
+            vmm.attach_legacy_devices().map_err(Error::StartMicrovm)?;
+        }
+
+        Ok(VmmBuilder { vmm, vcpus })
     }
 
     /// Adds a MmioDevice.
@@ -480,45 +508,17 @@ impl VmmBuilder {
 
     /// Start running and return the Vmm.
     pub fn run(mut self) -> result::Result<Vmm, VmmActionError> {
-        let request_ts = TimestampUs::default();
-
-        // ***** initiailly copied things from start_microvm
-
         // Use expect() to crash if the other thread poisoned this lock.
         self.vmm.shared_info
             .write()
             .expect("Failed to start microVM because shared info couldn't be written due to poisoned lock")
             .state = InstanceState::Starting;
 
-        let vcpus;
-
-        // For x86_64 we need to create the interrupt controller before calling `KVM_CREATE_VCPUS`
-        // while on aarch64 we need to do it the other way around.
-        #[cfg(target_arch = "x86_64")]
-        {
-            self.vmm.setup_interrupt_controller()?;
-
-            self.vmm.attach_legacy_devices()?;
-
-            let entry_addr = self.vmm.load_kernel()?;
-            vcpus = self.vmm.create_vcpus(entry_addr, request_ts)?;
-        }
-
-        #[cfg(target_arch = "aarch64")]
-        {
-            let entry_addr = self.load_kernel()?;
-            vcpus = self.create_vcpus(entry_addr, request_ts)?;
-
-            self.setup_interrupt_controller()?;
-            self.attach_virtio_devices()?;
-            self.attach_legacy_devices()?;
-        }
-
-        self.vmm.configure_system(vcpus.as_slice())?;
+        self.vmm.configure_system(self.vcpus.as_slice())?;
 
         self.vmm.register_events()?;
 
-        self.vmm.start_vcpus(vcpus)?;
+        self.vmm.start_vcpus(self.vcpus.split_off(0))?;
 
         // Use expect() to crash if the other thread poisoned this lock.
         self.vmm.shared_info
@@ -540,8 +540,6 @@ impl VmmBuilder {
         if LOGGER.log_metrics().is_err() {
             METRICS.logger.missed_metrics_count.inc();
         }
-
-        // ***** end of copied things
 
         Ok(self.vmm)
     }

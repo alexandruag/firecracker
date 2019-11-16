@@ -435,7 +435,7 @@ impl VmmController {
         LOGGER.set_include_level(logger_cfg.show_level);
 
         #[cfg(target_arch = "aarch64")]
-        let options: &Vec<Value> = &vec![];
+        let options = &vec![];
 
         #[cfg(target_arch = "x86_64")]
         let options = logger_cfg.options.as_array().unwrap();
