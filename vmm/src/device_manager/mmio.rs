@@ -14,7 +14,6 @@ use std::{fmt, io};
 use arch::aarch64::DeviceInfoForFDT;
 use arch::DeviceType;
 use devices;
-use devices::virtio::TYPE_BLOCK;
 use devices::{BusDevice, RawIOHandler};
 use kernel::cmdline as kernel_cmdline;
 use kvm_ioctls::{IoEventAddress, VmFd};
@@ -76,6 +75,9 @@ pub const MMIO_CFG_SPACE_OFF: u64 = 0x100;
 /// Manages the complexities of registering a MMIO device.
 pub struct MMIODeviceManager {
     pub bus: devices::Bus,
+    // TODO: This is currently in use by a method required by some tests. The field and all its
+    // usages will be removed after further refactoring.
+    #[allow(unused)]
     guest_mem: GuestMemory,
     mmio_base: u64,
     irq: u32,
@@ -103,21 +105,6 @@ impl MMIODeviceManager {
             id_to_dev_info: HashMap::new(),
             raw_io_handlers: HashMap::new(),
         }
-    }
-
-    /// Register a virtio device to be used via MMIO transport.
-    pub fn register_virtio_device(
-        &mut self,
-        vm: &VmFd,
-        device: Box<dyn devices::virtio::VirtioDevice>,
-        cmdline: &mut kernel_cmdline::Cmdline,
-        type_id: u32,
-        device_id: &str,
-    ) -> Result<u64> {
-        let mmio_device = devices::virtio::MmioDevice::new(self.guest_mem.clone(), device)
-            .map_err(Error::CreateMmioDevice)?;
-
-        self.register_mmio_device(vm, mmio_device, cmdline, type_id, device_id)
     }
 
     /// Register am already created MMIO device to be used via MMIO transport.
@@ -299,22 +286,6 @@ impl MMIODeviceManager {
         self.raw_io_handlers
             .get(&(device_type, device_type.to_string()))
     }
-
-    /// Update a drive by rebuilding its config space and rewriting it on the bus.
-    pub fn update_drive(&self, device_id: &str, new_size: u64) -> Result<()> {
-        match self.get_device(DeviceType::Virtio(TYPE_BLOCK), device_id) {
-            Some(device) => {
-                let data = devices::virtio::build_config_space(new_size);
-                let mut busdev = device.lock().map_err(|_| Error::UpdateFailed)?;
-
-                busdev.write(MMIO_CFG_SPACE_OFF, &data[..]);
-                busdev.interrupt(devices::virtio::VIRTIO_MMIO_INT_CONFIG);
-
-                Ok(())
-            }
-            None => Err(Error::DeviceNotFound),
-        }
-    }
 }
 
 /// Private structure for storing information about the MMIO device registered at some address on the bus.
@@ -352,13 +323,33 @@ mod tests {
     const QUEUE_SIZES: &[u16] = &[64];
 
     impl MMIODeviceManager {
-        // Removing the address of a device will generate an error when you try to update the
-        // drive. The purpose of this method is to test error scenarios and should otherwise
-        // not be used.
-        pub fn remove_device_info(&mut self, type_id: u32, id: &str) {
-            self.id_to_dev_info
-                .remove(&(DeviceType::Virtio(type_id), id.to_string()))
-                .unwrap();
+        fn register_virtio_device(
+            &mut self,
+            vm: &VmFd,
+            device: Box<dyn devices::virtio::VirtioDevice>,
+            cmdline: &mut kernel_cmdline::Cmdline,
+            type_id: u32,
+            device_id: &str,
+        ) -> Result<u64> {
+            let mmio_device = devices::virtio::MmioDevice::new(self.guest_mem.clone(), device)
+                .map_err(Error::CreateMmioDevice)?;
+
+            self.register_mmio_device(vm, mmio_device, cmdline, type_id, device_id)
+        }
+
+        fn update_drive(&self, device_id: &str, new_size: u64) -> Result<()> {
+            match self.get_device(DeviceType::Virtio(TYPE_BLOCK), device_id) {
+                Some(device) => {
+                    let data = devices::virtio::build_config_space(new_size);
+                    let mut busdev = device.lock().map_err(|_| Error::UpdateFailed)?;
+
+                    busdev.write(MMIO_CFG_SPACE_OFF, &data[..]);
+                    busdev.interrupt(devices::virtio::VIRTIO_MMIO_INT_CONFIG);
+
+                    Ok(())
+                }
+                None => Err(Error::DeviceNotFound),
+            }
         }
     }
 

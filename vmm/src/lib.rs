@@ -47,11 +47,8 @@ pub mod vmm_config;
 mod vstate;
 
 use std::collections::HashMap;
-use std::fs::{metadata, File, OpenOptions};
 use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::path::PathBuf;
-use std::process;
 use std::result;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Barrier, Mutex, RwLock};
@@ -66,11 +63,8 @@ use device_manager::legacy::PortIODeviceManager;
 #[cfg(target_arch = "aarch64")]
 use device_manager::mmio::MMIODeviceInfo;
 use device_manager::mmio::MMIODeviceManager;
-use devices::virtio::vsock::{TYPE_VSOCK, VSOCK_EVENTS_COUNT};
 use devices::virtio::EpollConfigConstructor;
-use devices::virtio::{self, MmioDevice};
-use devices::virtio::{BLOCK_EVENTS_COUNT, TYPE_BLOCK};
-use devices::virtio::{NET_EVENTS_COUNT, TYPE_NET};
+use devices::virtio::MmioDevice;
 use devices::{BusDevice, DeviceEventT, EpollHandler, RawIOHandler};
 use error::{Error, Result, UserResult};
 use fc_util::time::TimestampUs;
@@ -79,25 +73,19 @@ use kernel::loader as kernel_loader;
 use logger::error::LoggerError;
 #[cfg(target_arch = "x86_64")]
 use logger::LogOption;
-use logger::{AppInfo, Level, Metric, LOGGER, METRICS};
+use logger::{Metric, LOGGER, METRICS};
 use memory_model::{GuestAddress, GuestMemory};
 use net_util::TapError;
 #[cfg(target_arch = "aarch64")]
 use serde_json::Value;
 use sys_util::{EventFd, Terminal};
-use vmm_config::boot_source::{
-    BootSourceConfig, BootSourceConfigError, KernelConfig, DEFAULT_KERNEL_CMDLINE,
-};
-use vmm_config::device_config::DeviceConfigs;
-use vmm_config::drive::{BlockDeviceConfig, BlockDeviceConfigs, DriveError};
+use vmm_config::boot_source::{BootSourceConfig, BootSourceConfigError};
+use vmm_config::drive::{BlockDeviceConfig, DriveError};
 use vmm_config::instance_info::{InstanceInfo, InstanceState};
-use vmm_config::logger::{LoggerConfig, LoggerConfigError, LoggerLevel, LoggerWriter};
+use vmm_config::logger::{LoggerConfig, LoggerConfigError};
 use vmm_config::machine_config::{CpuFeaturesTemplate, VmConfig, VmConfigError};
-use vmm_config::net::{
-    NetworkInterfaceConfig, NetworkInterfaceConfigs, NetworkInterfaceError,
-    NetworkInterfaceUpdateConfig,
-};
-use vmm_config::vsock::{VsockDeviceConfig, VsockError};
+use vmm_config::net::{NetworkInterfaceConfig, NetworkInterfaceError};
+use vmm_config::vsock::VsockDeviceConfig;
 use vstate::{KvmContext, Vcpu, Vm};
 
 pub use error::{ErrorKind, StartMicrovmError, VmmActionError};
@@ -995,11 +983,6 @@ impl Vmm {
         }
     }
 
-    fn is_instance_initialized(&self) -> bool {
-        let error_string = "Cannot check instance initialization as shared info lock is poisoned";
-        self.shared_info.read().expect(error_string).state != InstanceState::Uninitialized
-    }
-
     fn handle_stdin_event(&self, buffer: &[u8]) -> Result<()> {
         match self.get_serial_device() {
             Some(serial) => {
@@ -1139,10 +1122,6 @@ impl Vmm {
 mod tests {
     use super::*;
 
-    extern crate tempfile;
-
-    use self::tempfile::{tempfile, NamedTempFile};
-
     impl Vmm {
         // Left around here because it's called by tests::create_vmm_object in the device_manager
         // mmio module.
@@ -1175,7 +1154,7 @@ mod tests {
             let guest_memory = GuestMemory::new(&[(GuestAddress(0), 0x10000)])
                 .expect("Could not create guest memory object");
 
-            let mut vcpu_config = VcpuConfig {
+            let vcpu_config = VcpuConfig {
                 vcpu_count: 1,
                 ht_enabled: false,
                 cpu_template: None,

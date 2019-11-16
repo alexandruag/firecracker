@@ -1,4 +1,3 @@
-use std::fmt::{Display, Formatter};
 use std::fs::{metadata, File, OpenOptions};
 use std::path::PathBuf;
 use std::process;
@@ -12,12 +11,10 @@ use super::{
 
 use arch::DeviceType;
 use device_manager::mmio::MMIO_CFG_SPACE_OFF;
-use devices::legacy::I8042DeviceError;
 use devices::virtio::vsock::{TYPE_VSOCK, VSOCK_EVENTS_COUNT};
 use devices::virtio::{
     self, MmioDevice, BLOCK_EVENTS_COUNT, NET_EVENTS_COUNT, TYPE_BLOCK, TYPE_NET,
 };
-use error::Error::StartMicrovm;
 use error::StartMicrovmError;
 use kernel::{cmdline as kernel_cmdline, loader as kernel_loader};
 use logger::error::LoggerError;
@@ -25,12 +22,10 @@ use logger::{AppInfo, Level, LOGGER};
 use memory_model::{GuestAddress, GuestMemory};
 use sys_util::EventFd;
 use vmm_config;
-use vmm_config::boot_source::{
-    BootSourceConfig, BootSourceConfigError, KernelConfig, DEFAULT_KERNEL_CMDLINE,
-};
+use vmm_config::boot_source::{BootSourceConfig, KernelConfig, DEFAULT_KERNEL_CMDLINE};
 use vmm_config::device_config::DeviceConfigs;
 use vmm_config::drive::{BlockDeviceConfig, BlockDeviceConfigs, DriveError};
-use vmm_config::instance_info::{InstanceInfo, InstanceState};
+use vmm_config::instance_info::InstanceInfo;
 use vmm_config::logger::{LoggerConfig, LoggerConfigError, LoggerLevel, LoggerWriter};
 use vmm_config::machine_config::{VmConfig, VmConfigError};
 use vmm_config::net::{
@@ -224,8 +219,9 @@ impl VmmController {
                 MmioDevice::new(builder.inner().guest_memory().clone(), net_box).map_err(|e| {
                     RegisterMMIODevice(super::device_manager::mmio::Error::CreateMmioDevice(e))
                 })?,
-            );
+            )?;
         }
+
         Ok(())
     }
 
@@ -259,8 +255,9 @@ impl VmmController {
                         )
                     },
                 )?,
-            );
+            )?;
         }
+
         Ok(())
     }
 

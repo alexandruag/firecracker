@@ -25,7 +25,6 @@ use memory_model::{Address, GuestAddress, GuestMemory, GuestMemoryError};
 use sys_util::EventFd;
 #[cfg(target_arch = "x86_64")]
 use vmm_config::machine_config::CpuFeaturesTemplate;
-use vmm_config::machine_config::VmConfig;
 
 const KVM_MEM_LOG_DIRTY_PAGES: u32 = 0x1;
 

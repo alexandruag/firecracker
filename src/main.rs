@@ -35,7 +35,7 @@ use sys_util::{EventFd, Terminal};
 use vmm::controller::VmmController;
 use vmm::signal_handler::register_signal_handlers;
 use vmm::vmm_config::instance_info::{InstanceInfo, InstanceState};
-use vmm::{EventLoopExitReason, Vmm};
+use vmm::EventLoopExitReason;
 
 const DEFAULT_API_SOCK_PATH: &str = "/tmp/firecracker.socket";
 const DEFAULT_INSTANCE_ID: &str = "anonymous-instance";
