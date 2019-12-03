@@ -311,14 +311,13 @@ impl DeviceInfoForFDT for MMIODeviceInfo {
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::vmm_config::instance_info::{InstanceInfo, InstanceState};
     use super::super::super::Vmm;
     use super::*;
     use arch;
     use devices::virtio::{ActivateResult, VirtioDevice, TYPE_BLOCK};
     use memory_model::{GuestAddress, GuestMemory};
     use std::sync::atomic::AtomicUsize;
-    use std::sync::{Arc, RwLock};
+    use std::sync::Arc;
     use sys_util::EventFd;
     const QUEUE_SIZES: &[u16] = &[64];
 
@@ -410,18 +409,7 @@ mod tests {
     impl devices::RawIOHandler for DummyDevice {}
 
     fn create_vmm_object() -> Vmm {
-        let shared_info = Arc::new(RwLock::new(InstanceInfo {
-            state: InstanceState::Uninitialized,
-            id: "TEST_ID".to_string(),
-            vmm_version: "1.0".to_string(),
-        }));
-
-        Vmm::new(
-            shared_info,
-            &EventFd::new().expect("cannot create eventFD"),
-            0,
-        )
-        .expect("Cannot Create VMM")
+        Vmm::new(&EventFd::new().expect("cannot create eventFD"), 0).expect("Cannot Create VMM")
     }
 
     #[test]

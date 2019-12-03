@@ -34,7 +34,7 @@ use mmds::MMDS;
 use sys_util::{EventFd, Terminal};
 use vmm::controller::VmmController;
 use vmm::signal_handler::register_signal_handlers;
-use vmm::vmm_config::instance_info::{InstanceInfo, InstanceState};
+use vmm::vmm_config::instance_info::InstanceInfo;
 use vmm::EventLoopExitReason;
 
 const DEFAULT_API_SOCK_PATH: &str = "/tmp/firecracker.socket";
@@ -176,8 +176,8 @@ fn main() {
     let no_api = cmd_arguments.is_present("no-api");
 
     let api_shared_info = Arc::new(RwLock::new(InstanceInfo {
-        state: InstanceState::Uninitialized,
         id: instance_id,
+        started: false,
         vmm_version: crate_version!().to_string(),
     }));
 

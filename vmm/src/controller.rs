@@ -34,22 +34,23 @@ use vmm_config::net::{
 };
 use vmm_config::vsock::{VsockDeviceConfig, VsockError};
 
-/// Enables pre-boot setup, instantiatioon and real time configuration of a Firecracker VMM.
+/// Enables pre-boot setup, instantiation and real time configuration of a Firecracker VMM.
 pub struct VmmController {
     device_configs: DeviceConfigs,
-    epoll_context: Option<EpollContext>,
-    guest_memory: Option<GuestMemory>,
+    epoll_context: EpollContext,
     kernel_config: Option<KernelConfig>,
     vm_config: VmConfig,
     shared_info: Arc<RwLock<InstanceInfo>>,
     vmm: Option<Vmm>,
     seccomp_level: u32,
-    instance_initialized: bool,
 }
 
 impl VmmController {
     fn is_instance_initialized(&self) -> bool {
-        self.instance_initialized
+        self.shared_info
+            .read()
+            .expect("poisoned shared_info")
+            .started
     }
 
     /// Inserts a block to be attached when the VM starts.
@@ -138,14 +139,11 @@ impl VmmController {
                 kernel_cmdline.insert_str(flags)?;
             }
 
-            let epoll_config = builder
-                .inner_mut()
-                .epoll_context_mut()
-                .allocate_tokens_for_virtio_device(
-                    TYPE_BLOCK,
-                    &drive_config.drive_id,
-                    BLOCK_EVENTS_COUNT,
-                );
+            let epoll_config = self.epoll_context.allocate_tokens_for_virtio_device(
+                TYPE_BLOCK,
+                &drive_config.drive_id,
+                BLOCK_EVENTS_COUNT,
+            );
 
             let rate_limiter = drive_config
                 .rate_limiter
@@ -165,9 +163,9 @@ impl VmmController {
 
             builder.attach_device(
                 drive_config.drive_id.clone(),
-                MmioDevice::new(builder.inner().guest_memory().clone(), block_box).map_err(
-                    |e| RegisterMMIODevice(super::device_manager::mmio::Error::CreateMmioDevice(e)),
-                )?,
+                MmioDevice::new(builder.guest_memory().clone(), block_box).map_err(|e| {
+                    RegisterMMIODevice(super::device_manager::mmio::Error::CreateMmioDevice(e))
+                })?,
             )?;
         }
 
@@ -181,10 +179,11 @@ impl VmmController {
         use StartMicrovmError::*;
 
         for cfg in self.device_configs.network_interface.iter_mut() {
-            let epoll_config = builder
-                .inner_mut()
-                .epoll_context_mut()
-                .allocate_tokens_for_virtio_device(TYPE_NET, &cfg.iface_id, NET_EVENTS_COUNT);
+            let epoll_config = self.epoll_context.allocate_tokens_for_virtio_device(
+                TYPE_NET,
+                &cfg.iface_id,
+                NET_EVENTS_COUNT,
+            );
 
             let allow_mmds_requests = cfg.allow_mmds_requests();
 
@@ -216,7 +215,7 @@ impl VmmController {
 
             builder.attach_device(
                 cfg.iface_id.clone(),
-                MmioDevice::new(builder.inner().guest_memory().clone(), net_box).map_err(|e| {
+                MmioDevice::new(builder.guest_memory().clone(), net_box).map_err(|e| {
                     RegisterMMIODevice(super::device_manager::mmio::Error::CreateMmioDevice(e))
                 })?,
             )?;
@@ -236,10 +235,11 @@ impl VmmController {
             )
             .map_err(StartMicrovmError::CreateVsockBackend)?;
 
-            let epoll_config = builder
-                .inner_mut()
-                .epoll_context_mut()
-                .allocate_tokens_for_virtio_device(TYPE_VSOCK, &cfg.vsock_id, VSOCK_EVENTS_COUNT);
+            let epoll_config = self.epoll_context.allocate_tokens_for_virtio_device(
+                TYPE_VSOCK,
+                &cfg.vsock_id,
+                VSOCK_EVENTS_COUNT,
+            );
 
             let vsock_box = Box::new(
                 devices::virtio::Vsock::new(u64::from(cfg.guest_cid), epoll_config, backend)
@@ -248,33 +248,28 @@ impl VmmController {
 
             builder.attach_device(
                 cfg.vsock_id.clone(),
-                MmioDevice::new(builder.inner().guest_memory().clone(), vsock_box).map_err(
-                    |e| {
-                        StartMicrovmError::RegisterMMIODevice(
-                            super::device_manager::mmio::Error::CreateMmioDevice(e),
-                        )
-                    },
-                )?,
+                MmioDevice::new(builder.guest_memory().clone(), vsock_box).map_err(|e| {
+                    StartMicrovmError::RegisterMMIODevice(
+                        super::device_manager::mmio::Error::CreateMmioDevice(e),
+                    )
+                })?,
             )?;
         }
 
         Ok(())
     }
 
-    fn init_guest_memory(&mut self) -> std::result::Result<(), StartMicrovmError> {
-        if self.guest_memory.is_none() {
-            let mem_size = self
-                .vm_config
-                .mem_size_mib
-                .ok_or(StartMicrovmError::GuestMemory(
-                    memory_model::GuestMemoryError::MemoryNotInitialized,
-                ))?
-                << 20;
-            let arch_mem_regions = arch::arch_memory_regions(mem_size);
-            self.guest_memory =
-                Some(GuestMemory::new(&arch_mem_regions).map_err(StartMicrovmError::GuestMemory)?);
-        }
-        Ok(())
+    fn create_guest_memory(&self) -> std::result::Result<GuestMemory, StartMicrovmError> {
+        let mem_size = self
+            .vm_config
+            .mem_size_mib
+            .ok_or(StartMicrovmError::GuestMemory(
+                memory_model::GuestMemoryError::MemoryNotInitialized,
+            ))?
+            << 20;
+        let arch_mem_regions = arch::arch_memory_regions(mem_size);
+
+        Ok(GuestMemory::new(&arch_mem_regions).map_err(StartMicrovmError::GuestMemory)?)
     }
 
     fn set_kernel_config(&mut self, kernel_config: KernelConfig) {
@@ -499,7 +494,7 @@ impl VmmController {
     /// Creates a new `VmmController`.
     pub fn new(
         api_shared_info: Arc<RwLock<InstanceInfo>>,
-        afi_event_fd: &EventFd,
+        api_event_fd: &EventFd,
         seccomp_level: u32,
     ) -> Result<Self> {
         let device_configs = DeviceConfigs::new(
@@ -510,32 +505,28 @@ impl VmmController {
 
         let mut epoll_context = EpollContext::new()?;
         epoll_context
-            .add_epollin_event(afi_event_fd, EpollDispatch::VmmActionRequest)
+            .add_epollin_event(api_event_fd, EpollDispatch::VmmActionRequest)
             .expect("Cannot add vmm control_fd to epoll.");
 
         Ok(VmmController {
             device_configs,
-            epoll_context: Some(epoll_context),
-            guest_memory: None,
+            epoll_context,
             kernel_config: None,
             vm_config: VmConfig::default(),
             shared_info: api_shared_info,
             vmm: None,
             seccomp_level,
-            instance_initialized: false,
         })
     }
 
-    fn load_kernel(&mut self) -> std::result::Result<GuestAddress, StartMicrovmError> {
+    fn load_kernel(
+        &mut self,
+        guest_memory: &GuestMemory,
+    ) -> std::result::Result<GuestAddress, StartMicrovmError> {
         use StartMicrovmError::*;
 
         // This is the easy way out of consuming the value of the kernel_cmdline.
         let kernel_config = self.kernel_config.as_mut().ok_or(MissingKernelConfig)?;
-
-        // It is safe to unwrap because the VM memory was initialized before in vm.memory_init().
-        let guest_memory = self.guest_memory.as_ref().ok_or(GuestMemory(
-            memory_model::GuestMemoryError::MemoryNotInitialized,
-        ))?;
 
         let entry_addr = kernel_loader::load_kernel(
             guest_memory,
@@ -549,42 +540,48 @@ impl VmmController {
 
     /// Starts a microVM based on the current configuration.
     pub fn start_microvm(&mut self) -> UserResult {
-        self.init_guest_memory()?;
-        let kernel_entry_addr = self.load_kernel()?;
+        if self.is_instance_initialized() {
+            // Reusing this error to represent that we've called this method before.
+            return Err(StartMicrovmError::MicroVMAlreadyRunning.into());
+        }
 
-        let epoll_context = self.epoll_context.take().expect("epoll_context");
+        // Setting this here to signal a start_microvm action has already been attempted.
+        self.shared_info
+            .write()
+            .expect("Failed to start microVM because shared info couldn't be written due to poisoned lock")
+            .started = true;
 
-        // TODO: Unwrap should not fail because first line in this function. Still, should
-        // make this prettier.
-        let guest_memory = self.guest_memory.take().unwrap();
-        let kernel_config = self.kernel_config.take().expect("kernel_config");
+        let guest_memory = self.create_guest_memory()?;
+        let kernel_entry_addr = self.load_kernel(&guest_memory)?;
 
-        // The unwraps are ok to use because the values are default intialized if not
-        // also supplied by the user.
+        let kernel_config = self
+            .kernel_config
+            .take()
+            .ok_or(StartMicrovmError::MissingKernelConfig)?;
+
+        // The unwraps are ok to use because the values are initialized using defaults if not
+        // supplied by the user.
         let vcpu_config = VcpuConfig {
-            vcpu_count: self.vm_config.vcpu_count.clone().unwrap(),
-            ht_enabled: self.vm_config.ht_enabled.clone().unwrap(),
-            cpu_template: self.vm_config.cpu_template.clone(),
+            vcpu_count: self.vm_config.vcpu_count.unwrap(),
+            ht_enabled: self.vm_config.ht_enabled.unwrap(),
+            cpu_template: self.vm_config.cpu_template,
         };
 
         let builder_config = VmmBuilderConfig {
             guest_memory,
-            kernel_entry_addr,
+            entry_addr: kernel_entry_addr,
             kernel_cmdline: kernel_config.cmdline,
             vcpu_config,
             seccomp_level: self.seccomp_level,
         };
 
-        // TODO: remove expect
-        let mut builder = VmmBuilder::new(epoll_context, builder_config, self.shared_info.clone())
-            .expect("failed to create vmm builder");
+        let mut builder = VmmBuilder::new(&mut self.epoll_context, builder_config)?;
 
         self.attach_block_devices(&mut builder)?;
         self.attach_net_devices(&mut builder)?;
         self.attach_vsock_device(&mut builder)?;
 
-        self.vmm = Some(builder.run()?);
-        self.instance_initialized = true;
+        self.vmm = Some(builder.run(&mut self.epoll_context)?);
 
         Ok(())
     }
@@ -592,13 +589,15 @@ impl VmmController {
     /// Wait for and dispatch events. Will defer to the inner Vmm loop after it's started.
     pub fn run_event_loop(&mut self) -> Result<EventLoopExitReason> {
         if let Some(vmm) = self.vmm.as_mut() {
-            vmm.run_event_loop()
+            vmm.run_event_loop(&mut self.epoll_context)
         } else {
-            // The only possible event so far is getting a command from the API server. The
-            // unwrap should not fail because the EpollContext hasn't been passed yet to the
-            // inner Vmm.
-            let _ = self.epoll_context.as_mut().unwrap().get_event()?;
-            Ok(EventLoopExitReason::ControlAction)
+            // The only possible event so far is getting a command from the API server.
+            let event = self.epoll_context.get_event()?;
+            match self.epoll_context.dispatch_table[event.data as usize] {
+                Some(EpollDispatch::VmmActionRequest) => Ok(EventLoopExitReason::ControlAction),
+                // TODO: Very unlikely this happens. Temporary solution untill we switch to polly.
+                _ => panic!("Unexpected VmmController epoll event"),
+            }
         }
     }
 
@@ -652,10 +651,7 @@ impl VmmController {
     ) -> result::Result<(), DriveError> {
         // The unwrap is safe because this is only called after the inner Vmm has booted.
         let handler = self
-            .vmm
-            .as_mut()
-            .unwrap()
-            .epoll_context_mut()
+            .epoll_context
             .get_device_handler_by_device_id::<virtio::BlockEpollHandler>(TYPE_BLOCK, drive_id)
             .map_err(|_| DriveError::EpollHandlerNotFound)?;
 
@@ -726,10 +722,7 @@ impl VmmController {
             // live device.
 
             let handler = self
-                .vmm
-                .as_mut()
-                .unwrap()
-                .epoll_context_mut()
+                .epoll_context
                 .get_device_handler_by_device_id::<virtio::NetEpollHandler>(
                     TYPE_NET,
                     &new_cfg.iface_id,

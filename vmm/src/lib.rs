@@ -51,7 +51,7 @@ use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::result;
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Barrier, Mutex, RwLock};
+use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -80,7 +80,6 @@ use net_util::TapError;
 use sys_util::{EventFd, Terminal};
 use vmm_config::boot_source::{BootSourceConfig, BootSourceConfigError};
 use vmm_config::drive::{BlockDeviceConfig, DriveError};
-use vmm_config::instance_info::{InstanceInfo, InstanceState};
 use vmm_config::logger::{LoggerConfig, LoggerConfigError};
 use vmm_config::machine_config::{CpuFeaturesTemplate, VmConfig, VmConfigError};
 use vmm_config::net::{NetworkInterfaceConfig, NetworkInterfaceError};
@@ -397,8 +396,8 @@ pub struct VcpuConfig {
 pub struct VmmBuilderConfig {
     /// The guest memory object for this VM.
     pub guest_memory: GuestMemory,
-    /// Kernel entry address within the guest memory object.
-    pub kernel_entry_addr: GuestAddress,
+    /// The guest physical address of the execution entry point.
+    pub entry_addr: GuestAddress,
     /// Base kernel command line contents.
     pub kernel_cmdline: KernelCmdline,
     /// vCPU configuration paramters.
@@ -416,12 +415,12 @@ pub struct VmmBuilder {
 impl VmmBuilder {
     /// Create a new VmmBuilder.
     pub fn new(
-        mut epoll_context: EpollContext,
+        epoll_context: &mut EpollContext,
         config: VmmBuilderConfig,
-        shared_info: Arc<RwLock<InstanceInfo>>,
-    ) -> Result<Self> {
-        let write_metrics_event_fd =
-            TimerFd::new_custom(ClockId::Monotonic, true, true).map_err(Error::TimerFd)?;
+    ) -> std::result::Result<Self, VmmActionError> {
+        let write_metrics_event_fd = TimerFd::new_custom(ClockId::Monotonic, true, true)
+            .map_err(Error::TimerFd)
+            .map_err(StartMicrovmError::Internal)?;
 
         epoll_context
             .add_epollin_event(
@@ -431,13 +430,16 @@ impl VmmBuilder {
             )
             .expect("Cannot add write metrics TimerFd to epoll.");
 
-        let kvm = KvmContext::new().map_err(Error::KvmContext)?;
+        let kvm = KvmContext::new()
+            .map_err(Error::KvmContext)
+            .map_err(StartMicrovmError::Internal)?;
 
-        let mut vm = Vm::new(kvm.fd()).map_err(Error::Vm)?;
+        let mut vm = Vm::new(kvm.fd())
+            .map_err(Error::Vm)
+            .map_err(StartMicrovmError::Internal)?;
 
         vm.memory_init(config.guest_memory.clone(), &kvm)
-            .map_err(StartMicrovmError::ConfigureVm)
-            .map_err(Error::StartMicrovm)?;
+            .map_err(StartMicrovmError::ConfigureVm)?;
 
         // Instantiate the MMIO device manager.
         // 'mmio_base' address has to be an address which is protected by the kernel
@@ -449,7 +451,6 @@ impl VmmBuilder {
         );
 
         let mut vmm = Vmm {
-            shared_info,
             stdin_handle: io::stdin(),
             guest_memory: config.guest_memory,
             vcpu_config: config.vcpu_config,
@@ -459,8 +460,9 @@ impl VmmBuilder {
             vm,
             mmio_device_manager,
             #[cfg(target_arch = "x86_64")]
-            pio_device_manager: PortIODeviceManager::new().map_err(Error::CreateLegacyDevice)?,
-            epoll_context,
+            pio_device_manager: PortIODeviceManager::new()
+                .map_err(Error::CreateLegacyDevice)
+                .map_err(StartMicrovmError::Internal)?,
             write_metrics_event_fd,
             seccomp_level: config.seccomp_level,
         };
@@ -469,11 +471,10 @@ impl VmmBuilder {
         // while on aarch64 we need to do it the other way around.
         #[cfg(target_arch = "x86_64")]
         {
-            vmm.setup_interrupt_controller()
-                .map_err(Error::StartMicrovm)?;
+            vmm.setup_interrupt_controller()?;
             // This call has to be here after setting up the irqchip, because
             // we set up some irqfd inside for some reason.
-            vmm.attach_legacy_devices().map_err(Error::StartMicrovm)?;
+            vmm.attach_legacy_devices()?;
         }
 
         // This was supposed to be the timestamp when the start command is recevied. Having this
@@ -481,18 +482,20 @@ impl VmmBuilder {
         // decoupled from the creation. At this point it's still fine because we create the
         // builder and run the Vmm when the StartMicrovm request is received by the controller.
         let request_ts = TimestampUs::default();
-        let vcpus = vmm
-            .create_vcpus(config.kernel_entry_addr, request_ts)
-            .map_err(Error::StartMicrovm)?;
+        let vcpus = vmm.create_vcpus(config.entry_addr, request_ts)?;
 
         #[cfg(target_arch = "aarch64")]
         {
-            vmm.setup_interrupt_controller()
-                .map_err(Error::StartMicrovm)?;
-            vmm.attach_legacy_devices().map_err(Error::StartMicrovm)?;
+            vmm.setup_interrupt_controller()?;
+            vmm.attach_legacy_devices()?;
         }
 
         Ok(VmmBuilder { vmm, vcpus })
+    }
+
+    /// Return a reference to the guest memory object used by the builder.
+    pub fn guest_memory(&self) -> &GuestMemory {
+        self.vmm.guest_memory()
     }
 
     /// Returns a mutable reference to the guest kernel cmdline.
@@ -520,7 +523,7 @@ impl VmmBuilder {
     }
 
     /// Start running and return the Vmm.
-    pub fn run(mut self) -> result::Result<Vmm, VmmActionError> {
+    pub fn run(mut self, epoll_context: &mut EpollContext) -> result::Result<Vmm, VmmActionError> {
         // Write the kernel command line to guest memory. This is x86_64 specific, since on
         // aarch64 the command line will be specified through the FDT.
         #[cfg(target_arch = "x86_64")]
@@ -535,25 +538,11 @@ impl VmmBuilder {
         )
         .map_err(StartMicrovmError::LoadCommandline)?;
 
-        // ***** initiailly copied things from start_microvm
-
-        // Use expect() to crash if the other thread poisoned this lock.
-        self.vmm.shared_info
-            .write()
-            .expect("Failed to start microVM because shared info couldn't be written due to poisoned lock")
-            .state = InstanceState::Starting;
-
         self.vmm.configure_system(self.vcpus.as_slice())?;
 
-        self.vmm.register_events()?;
+        self.vmm.register_events(epoll_context)?;
 
         self.vmm.start_vcpus(self.vcpus)?;
-
-        // Use expect() to crash if the other thread poisoned this lock.
-        self.vmm.shared_info
-            .write()
-            .expect("Failed to start microVM because shared info couldn't be written due to poisoned lock")
-            .state = InstanceState::Running;
 
         // Arm the log write timer.
         // TODO: the timer does not stop on InstanceStop.
@@ -570,25 +559,12 @@ impl VmmBuilder {
             METRICS.logger.missed_metrics_count.inc();
         }
 
-        // ***** end of copied things
-
         Ok(self.vmm)
-    }
-
-    /// Returns a borrowed handle to the inner Vmm.
-    pub fn inner(&self) -> &Vmm {
-        &self.vmm
-    }
-
-    /// Returns a mutable handle to the inner Vmm.
-    pub fn inner_mut(&mut self) -> &mut Vmm {
-        &mut self.vmm
     }
 }
 
 /// Contains the state and associated methods required for the Firecracker VMM.
 pub struct Vmm {
-    shared_info: Arc<RwLock<InstanceInfo>>,
     stdin_handle: io::Stdin,
 
     // Guest VM core resources.
@@ -606,24 +582,12 @@ pub struct Vmm {
     #[cfg(target_arch = "x86_64")]
     pio_device_manager: PortIODeviceManager,
 
-    epoll_context: EpollContext,
-
     write_metrics_event_fd: TimerFd,
     // The level of seccomp filtering used. Seccomp filters are loaded before executing guest code.
     seccomp_level: u32,
 }
 
 impl Vmm {
-    /// Returns a borrowed handle for the inner `EpollContext` object.
-    pub fn epoll_context(&self) -> &EpollContext {
-        &self.epoll_context
-    }
-
-    /// Returns a mutable handle for the inner `EpollContext` object.
-    pub fn epoll_context_mut(&mut self) -> &mut EpollContext {
-        &mut self.epoll_context
-    }
-
     /// Gets the the specified bus device.
     pub fn get_bus_device(
         &self,
@@ -867,7 +831,10 @@ impl Vmm {
         Ok(())
     }
 
-    fn register_events(&mut self) -> std::result::Result<(), StartMicrovmError> {
+    fn register_events(
+        &mut self,
+        epoll_context: &mut EpollContext,
+    ) -> std::result::Result<(), StartMicrovmError> {
         #[cfg(target_arch = "x86_64")]
         {
             use StartMicrovmError::*;
@@ -880,14 +847,14 @@ impl Vmm {
                 .get_reset_evt_clone()
                 .map_err(|_| EventFd)?;
 
-            self.epoll_context
+            epoll_context
                 .add_epollin_event(&exit_poll_evt_fd, EpollDispatch::Exit)
                 .map_err(|_| RegisterEvent)?;
 
             self.exit_evt = Some(exit_poll_evt_fd);
         }
 
-        self.epoll_context.enable_stdin_event();
+        epoll_context.enable_stdin_event();
 
         Ok(())
     }
@@ -957,10 +924,13 @@ impl Vmm {
 
     /// Wait on VMM events and dispatch them to the appropriate handler. Returns to the caller
     /// when a control action occurs.
-    pub fn run_event_loop(&mut self) -> Result<EventLoopExitReason> {
+    pub fn run_event_loop(
+        &mut self,
+        epoll_context: &mut EpollContext,
+    ) -> Result<EventLoopExitReason> {
         // TODO: try handling of errors/failures without breaking this main loop.
         loop {
-            let event = self.epoll_context.get_event()?;
+            let event = epoll_context.get_event()?;
             let evset = match epoll::Events::from_bits(event.events) {
                 Some(evset) => evset,
                 None => {
@@ -970,7 +940,7 @@ impl Vmm {
                 }
             };
 
-            match self.epoll_context.dispatch_table[event.data as usize] {
+            match epoll_context.dispatch_table[event.data as usize] {
                 Some(EpollDispatch::Exit) => {
                     match self.exit_evt {
                         Some(ref ev) => {
@@ -986,11 +956,11 @@ impl Vmm {
                     match stdin_lock.read_raw(&mut out[..]) {
                         Ok(0) => {
                             // Zero-length read indicates EOF. Remove from pollables.
-                            self.epoll_context.disable_stdin_event();
+                            epoll_context.disable_stdin_event();
                         }
                         Err(e) => {
                             warn!("error while reading stdin: {:?}", e);
-                            self.epoll_context.disable_stdin_event();
+                            epoll_context.disable_stdin_event();
                         }
                         Ok(count) => {
                             self.handle_stdin_event(&out[..count])?;
@@ -999,10 +969,7 @@ impl Vmm {
                 }
                 Some(EpollDispatch::DeviceHandler(device_idx, device_token)) => {
                     METRICS.vmm.device_events.inc();
-                    match self
-                        .epoll_context
-                        .get_device_handler_by_handler_id(device_idx)
-                    {
+                    match epoll_context.get_device_handler_by_handler_id(device_idx) {
                         Ok(handler) => match handler.handle_event(device_token, evset) {
                             Err(devices::Error::PayloadExpected) => {
                                 panic!("Received update disk image event with empty payload.")
@@ -1081,11 +1048,7 @@ mod tests {
         // Left around here because it's called by tests::create_vmm_object in the device_manager
         // mmio module.
         /// Creates a new VMM object.
-        pub fn new(
-            shared_info: Arc<RwLock<InstanceInfo>>,
-            control_fd: &dyn AsRawFd,
-            seccomp_level: u32,
-        ) -> Result<Self> {
+        pub fn new(control_fd: &dyn AsRawFd, seccomp_level: u32) -> Result<Self> {
             let mut epoll_context = EpollContext::new()?;
             // If this fails, it's fatal; using expect() to crash.
             epoll_context
@@ -1125,7 +1088,6 @@ mod tests {
             );
 
             Ok(Vmm {
-                shared_info,
                 stdin_handle: io::stdin(),
                 guest_memory,
                 vcpu_config,
@@ -1137,7 +1099,6 @@ mod tests {
                 #[cfg(target_arch = "x86_64")]
                 pio_device_manager: PortIODeviceManager::new()
                     .map_err(Error::CreateLegacyDevice)?,
-                epoll_context,
                 write_metrics_event_fd,
                 seccomp_level,
             })
