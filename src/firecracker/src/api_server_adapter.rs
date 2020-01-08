@@ -8,11 +8,13 @@ use std::thread;
 
 use api_server::{ApiServer, VmmRequest, VmmResponse};
 use mmds::MMDS;
+use polly::event_manager::EventManager;
 use utils::eventfd::EventFd;
 use vmm::controller::VmmController;
 use vmm::resources::VmResources;
 use vmm::vmm_config;
 use vmm::vmm_config::instance_info::InstanceInfo;
+use vmm::EpollDispatch;
 
 struct ApiAdapter {
     api_event_fd: EventFd,
@@ -42,6 +44,7 @@ impl ApiAdapter {
         seccomp_level: u32,
         // FIXME: epoll context can be polluted by failing boot attempts
         epoll_context: &mut vmm::EpollContext,
+        event_manager: &mut EventManager,
     ) -> (VmResources, vmm::Vmm) {
         let mut vm_resources = VmResources::default();
         // Configure and start microVM through successive API calls.
@@ -63,6 +66,7 @@ impl ApiAdapter {
                         &mut vm_resources,
                         seccomp_level,
                         epoll_context,
+                        event_manager,
                     );
 
                     // Send back the result.
@@ -89,6 +93,7 @@ impl ApiAdapter {
         vm_resources: &mut VmResources,
         seccomp_level: u32,
         epoll_context: &mut vmm::EpollContext,
+        event_manager: &mut EventManager,
     ) -> (VmmResponse, Option<vmm::Vmm>) {
         use api_server::VmmAction::*;
         use vmm::{ErrorKind, VmmActionError};
@@ -133,14 +138,16 @@ impl ApiAdapter {
                 .update_net_rate_limiters(netif_update)
                 .map(|_| api_server::VmmData::Empty)
                 .map_err(|e| e.into()),
-            StartMicroVm => {
-                vmm::builder::build_microvm(&vm_resources, epoll_context, seccomp_level).map(
-                    |vmm| {
-                        maybe_vmm = Some(vmm);
-                        api_server::VmmData::Empty
-                    },
-                )
-            }
+            StartMicroVm => vmm::builder::build_microvm(
+                &vm_resources,
+                epoll_context,
+                event_manager,
+                seccomp_level,
+            )
+            .map(|vmm| {
+                maybe_vmm = Some(vmm);
+                api_server::VmmData::Empty
+            }),
 
             ///////////////////////////////////
             // Operations not allowed pre-boot.
@@ -302,6 +309,11 @@ pub fn run_with_api(
 
     // The driving epoll engine.
     let mut epoll_context = vmm::EpollContext::new().expect("Cannot create the epoll context.");
+    let mut event_manager = EventManager::new().expect("Unable to create EventManager");
+
+    epoll_context
+        .add_epollin_event(&event_manager, EpollDispatch::PollyEvent)
+        .expect("Cannot cascade EventManager from epoll_context");
 
     epoll_context
         .add_epollin_event(&api_event_fd, vmm::EpollDispatch::VmmActionRequest)
@@ -311,13 +323,23 @@ pub fn run_with_api(
 
     // Configure, build and start the microVM.
     let (vm_resources, vmm) = match config_json {
-        Some(json) => super::build_microvm_from_json(seccomp_level, json, &mut epoll_context),
-        None => api_handler.build_microvm_from_requests(seccomp_level, &mut epoll_context),
+        Some(json) => super::build_microvm_from_json(
+            seccomp_level,
+            json,
+            &mut epoll_context,
+            &mut event_manager,
+        ),
+        None => api_handler.build_microvm_from_requests(
+            seccomp_level,
+            &mut epoll_context,
+            &mut event_manager,
+        ),
     };
 
     // Update the api shared instance info.
     api_shared_info.write().unwrap().started = true;
 
-    let vm_controller: VmmController = VmmController::new(epoll_context, vm_resources, vmm);
+    let vm_controller: VmmController =
+        VmmController::new(epoll_context, event_manager, vm_resources, vmm);
     vm_controller.run(&api_handler);
 }

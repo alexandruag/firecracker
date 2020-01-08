@@ -90,7 +90,7 @@ pub enum StartMicrovmError {
     /// Split this at some point.
     /// Internal errors are due to resource exhaustion.
     /// Users errors are due to invalid permissions.
-    CreateNetDevice(devices::virtio::Error),
+    CreateNetDevice(devices::virtio::net::Error),
     /// Failed to create a `RateLimiter` object.
     CreateRateLimiter(std::io::Error),
     /// Failed to create the backend for the vsock device.
@@ -492,12 +492,14 @@ impl Display for VmmActionError {
                 Logger(_, ref err) => err.to_string(),
                 MachineConfig(_, ref err) => err.to_string(),
                 NetworkConfig(_, ref err) => err.to_string(),
-                OperationNotSupportedPostBoot =>
+                OperationNotSupportedPostBoot => {
                     "The requested operation is not supported after starting the microVM."
-                        .to_string(),
-                OperationNotSupportedPreBoot =>
+                        .to_string()
+                }
+                OperationNotSupportedPreBoot => {
                     "The requested operation is not supported before starting the microVM."
-                        .to_string(),
+                        .to_string()
+                }
                 StartMicrovm(_, ref err) => err.to_string(),
                 SendCtrlAltDel(_, ref err) => err.to_string(),
                 VsockConfig(_, ref err) => err.to_string(),

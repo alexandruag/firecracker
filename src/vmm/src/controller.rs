@@ -6,11 +6,14 @@ use std::io::{Seek, SeekFrom};
 use std::path::PathBuf;
 use std::result;
 
-use super::{EpollContext, EventLoopExitReason, Result, UserResult, Vmm, VmmActionError};
+use super::{
+    EpollContext, EventLoopExitReason, Result, UserResult, Vmm, VmmActionError,
+};
 
 use arch::DeviceType;
 use device_manager::mmio::MMIO_CFG_SPACE_OFF;
 use devices::virtio::{self, TYPE_BLOCK, TYPE_NET};
+use polly::event_manager::EventManager;
 use resources::VmResources;
 use vmm_config;
 use vmm_config::drive::DriveError;
@@ -26,6 +29,7 @@ pub trait ControlEventHandler {
 /// Enables pre-boot setup, instantiation and real time configuration of a Firecracker VMM.
 pub struct VmmController {
     epoll_context: EpollContext,
+    event_manager: EventManager,
     vm_resources: VmResources,
     vmm: Vmm,
 }
@@ -56,9 +60,15 @@ impl VmmController {
     }
 
     /// Creates a new `VmmController`.
-    pub fn new(epoll_context: EpollContext, vm_resources: VmResources, vmm: Vmm) -> Self {
+    pub fn new(
+        epoll_context: EpollContext,
+        event_manager: EventManager,
+        vm_resources: VmResources,
+        vmm: Vmm,
+    ) -> Self {
         VmmController {
             epoll_context,
+            event_manager,
             vm_resources,
             vmm,
         }
@@ -66,7 +76,8 @@ impl VmmController {
 
     /// Wait for and dispatch events. Will defer to the inner Vmm loop after it's started.
     pub fn run_event_loop(&mut self) -> Result<EventLoopExitReason> {
-        self.vmm.run_event_loop(&mut self.epoll_context)
+        self.vmm
+            .run_event_loop(&mut self.epoll_context, &mut self.event_manager)
     }
 
     /// Runs the vmm to completion, any control events are deferred to the `ControlActionHandler`.
@@ -141,15 +152,16 @@ impl VmmController {
         drive_id: &str,
         disk_image: File,
     ) -> result::Result<(), DriveError> {
-        // The unwrap is safe because this is only called after the inner Vmm has booted.
-        let handler = self
-            .epoll_context
-            .get_device_handler_by_device_id::<virtio::BlockEpollHandler>(TYPE_BLOCK, drive_id)
-            .map_err(|_| DriveError::EpollHandlerNotFound)?;
-
-        handler
-            .update_disk_image(disk_image)
-            .map_err(|_| DriveError::BlockDeviceUpdateFailed)
+        if let Some(handler) = self.vmm.mmio_device_manager.get_block_device(drive_id) {
+            handler
+                .lock()
+                .expect("Poisoned device lock")
+                .update_disk_image(disk_image)
+                .map_err(|_| DriveError::BlockDeviceUpdateFailed)
+        } else {
+            // TODO: Update this error after all devices have been ported.
+            Err(DriveError::EpollHandlerNotFound)
+        }
     }
 
     /// Updates the path of the host file backing the emulated block device with id `drive_id`.
