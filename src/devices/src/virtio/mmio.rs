@@ -15,8 +15,6 @@ use super::device_status;
 use super::*;
 use crate::bus::BusDevice;
 
-use polly::event_manager::*;
-use polly::pollable::*;
 //TODO crosvm uses 0 here, but IIRC virtio specified some other vendor id that should be used
 const VENDOR_ID: u32 = 0;
 
