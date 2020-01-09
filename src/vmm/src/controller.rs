@@ -6,9 +6,7 @@ use std::io::{Seek, SeekFrom};
 use std::path::PathBuf;
 use std::result;
 
-use super::{
-    EpollContext, EventLoopExitReason, Result, UserResult, Vmm, VmmActionError,
-};
+use super::{EpollContext, EventLoopExitReason, Result, UserResult, Vmm, VmmActionError};
 
 use arch::DeviceType;
 use device_manager::mmio::MMIO_CFG_SPACE_OFF;
