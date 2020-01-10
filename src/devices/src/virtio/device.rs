@@ -7,11 +7,9 @@
 
 use std::sync::{atomic::AtomicUsize, Arc};
 
-use super::*;
+use super::{Queue, ActivateResult};
 use memory_model::GuestMemory;
 use utils::eventfd::EventFd;
-
-use polly::pollable::*;
 
 /// Trait for virtio devices to be driven by a virtio transport.
 ///
@@ -98,13 +96,5 @@ pub trait VirtioDevice: Send {
     /// event, and queue events.
     fn reset(&mut self) -> Option<(EventFd, Vec<EventFd>)> {
         None
-    }
-
-    fn handle_read(&mut self, _source: Pollable) -> Vec<PollableOp> {
-        vec![]
-    }
-
-    fn init(&mut self) -> Vec<PollableOp> {
-        vec![]
     }
 }

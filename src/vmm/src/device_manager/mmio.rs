@@ -132,9 +132,7 @@ impl MMIODeviceManager {
         }
 
         for (i, queue_evt) in transport_device
-            .device()
-            .lock()
-            .expect("Poisoned device lock")
+            .locked_device()
             .get_queue_events()
             .iter()
             .enumerate()
@@ -147,11 +145,7 @@ impl MMIODeviceManager {
                 .map_err(Error::RegisterIoEvent)?;
         }
 
-        let interrupt_evt = transport_device
-            .device()
-            .lock()
-            .expect("Poisoned device lock")
-            .get_interrupt();
+        let interrupt_evt = transport_device.locked_device().get_interrupt();
         vm.register_irqfd(&interrupt_evt, self.irq)
             .map_err(Error::RegisterIrqFd)?;
 
@@ -194,6 +188,10 @@ impl MMIODeviceManager {
         Ok(())
     }
 
+    // This is the secondary path for registering devices.
+    // TODO: Replace with a generic path for all devices insted of being
+    // Block specific.
+    //
     // Register a new block device using Mmio as transport.
     pub fn register_block_device(
         &mut self,
@@ -204,6 +202,8 @@ impl MMIODeviceManager {
         device_id: &str,
     ) -> Result<()> {
         self.register_device_resources(vm, transport_device, cmdline, device_id, TYPE_BLOCK)?;
+        // Temporarly use this hashmap. It is used to retrieve the Block object
+        // in update_drive_handler().
         self.block_devices.insert(device_id.to_owned(), device);
 
         Ok(())
@@ -223,9 +223,7 @@ impl MMIODeviceManager {
         }
 
         for (i, queue_evt) in mmio_device
-            .device()
-            .lock()
-            .expect("Poisoned device lock")
+            .locked_device()
             .get_queue_events()
             .iter()
             .enumerate()
@@ -238,15 +236,8 @@ impl MMIODeviceManager {
                 .map_err(Error::RegisterIoEvent)?;
         }
 
-        vm.register_irqfd(
-            &mmio_device
-                .device()
-                .lock()
-                .expect("Poisoned device lock")
-                .get_interrupt(),
-            self.irq,
-        )
-        .map_err(Error::RegisterIrqFd)?;
+        vm.register_irqfd(&mmio_device.locked_device().get_interrupt(), self.irq)
+            .map_err(Error::RegisterIrqFd)?;
 
         self.bus
             .insert(Arc::new(Mutex::new(mmio_device)), self.mmio_base, MMIO_LEN)

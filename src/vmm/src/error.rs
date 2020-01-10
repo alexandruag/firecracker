@@ -666,7 +666,7 @@ mod tests {
         );
         assert_eq!(
             error_kind(StartMicrovmError::CreateNetDevice(
-                devices::virtio::Error::TapOpen(utils::net::TapError::CreateTap(
+                devices::virtio::net::Error::TapOpen(utils::net::TapError::CreateTap(
                     io::Error::from_raw_os_error(0)
                 ))
             )),
