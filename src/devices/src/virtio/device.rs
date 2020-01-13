@@ -7,7 +7,7 @@
 
 use std::sync::{atomic::AtomicUsize, Arc};
 
-use super::{Queue, ActivateResult};
+use super::{ActivateResult, AsAny, Queue};
 use memory_model::GuestMemory;
 use utils::eventfd::EventFd;
 
@@ -18,7 +18,7 @@ use utils::eventfd::EventFd;
 /// and all the events, memory, and queues for device operation will be moved into the device.
 /// Optionally, a virtio device can implement device reset in which it returns said resources and
 /// resets its internal.
-pub trait VirtioDevice: Send {
+pub trait VirtioDevice: AsAny + Send {
     /// Get the available features offered by device.
     fn avail_features(&self) -> u64;
 

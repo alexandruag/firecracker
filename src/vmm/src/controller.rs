@@ -10,7 +10,7 @@ use super::{EpollContext, EventLoopExitReason, Result, UserResult, Vmm, VmmActio
 
 use arch::DeviceType;
 use device_manager::mmio::MMIO_CFG_SPACE_OFF;
-use devices::virtio::{self, TYPE_BLOCK, TYPE_NET};
+use devices::virtio::{self, Block, MmioTransport, TYPE_BLOCK, TYPE_NET};
 use polly::event_manager::EventManager;
 use resources::VmResources;
 use vmm_config;
@@ -150,16 +150,35 @@ impl VmmController {
         drive_id: &str,
         disk_image: File,
     ) -> result::Result<(), DriveError> {
-        if let Some(handler) = self.vmm.mmio_device_manager.get_block_device(drive_id) {
-            handler
+        if let Some(busdev) = self
+            .vmm
+            .get_bus_device(DeviceType::Virtio(TYPE_BLOCK), drive_id)
+        {
+            // Getting a handle to the Block device through AsAny usage.
+            // We could also keep an Arc<Mutex<Block>> collection within the controller (which is
+            // Firecracker specific), instead of doing in in the Vmm::DeviceManager.
+
+            let virtio_device = busdev
                 .lock()
                 .expect("Poisoned device lock")
+                .as_any()
+                .downcast_ref::<MmioTransport>()
+                // Only MmioTransport implements BusDevice at this point.
+                .expect("Unexpected BusDevice type")
+                .device();
+
+            return virtio_device
+                .lock()
+                .expect("Poisoned device lock")
+                .as_mut_any()
+                .downcast_mut::<Block>()
+                // We've previously checked the device type is Block.
+                .unwrap()
                 .update_disk_image(disk_image)
-                .map_err(|_| DriveError::BlockDeviceUpdateFailed)
-        } else {
-            // TODO: Update this error after all devices have been ported.
-            Err(DriveError::EpollHandlerNotFound)
+                .map_err(|_| DriveError::BlockDeviceUpdateFailed);
         }
+        // TODO: Update this error after all devices have been ported.
+        Err(DriveError::EpollHandlerNotFound)
     }
 
     /// Updates the path of the host file backing the emulated block device with id `drive_id`.
