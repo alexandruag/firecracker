@@ -1,45 +1,10 @@
-//! This is the original iteration of the `VersionedSerde` trait, which addressed both
-//! the versioned serialization and deserialization aspects:
-//!
-//! ```
-//! use serde::{Deserialize, Serialize};
-//!
-//! pub trait VersionedSerde<'de>: Sized {
-//!     type Version: Serialize;
-//!     type S: Serialize;
-//!     type D: Deserialize<'de> + Into<Self>;
-//!
-//!     fn versioned_serialize(&self, target_version: Self::Version) -> Self::S;
-//! }
-//! ```
-//!
-//! Values of type `Self::Version` are used to denote different versions of the type implementing
-//! the `VersionedSerde` trait.
-//!
-//! Values of type `Self::S` are constructed by the `versioned_serialize` method,
-//! and when serialized implement the actual versioned serialization logic for the provided
-//! target version.
-//!
-//! The `Self::D` associated type can be deserialized from the results of serializing `Self::S`
-//! for any known `Self::Version`, and then can be converted into value of the current version
-//! of `Self` via `Into`.
-//!
-//! Ultimately, the `VersionedSerde` trait has been split for two reasons:
-//! - It sometimes makes sense to only implement (or have in scope) either serialization or
-//!   deserialization, but not both.
-//! - Most concrete implementations of `Self::S` tend to have an associated lifetime, because
-//!   they include a `&'a Self` reference, which needs to be explicitly declared, and makes
-//!   implementing the trait awkward in many situations. To go around this, we use the
-//!   Paolo maneuver, where we implement the serialization half of the trait for `&'a T`
-//!   instead of `T`, to get the lifetime from the type definition. The `Generic Associated Types`
-//!   [proposal](https://github.com/rust-lang/rust/issues/44265) will help once implemented. The
-//!   deserialize half makes use of the `Into<Self>` bound for `Self::D`, so we implement it
-//!   for `T` itself.
+mod indirect_de;
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
-/// Implementors of this trait support versioned serialization.
-pub trait VersionedSerialize {
+pub use indirect_de::IndirectDeserialize;
+
+pub trait Versioned {
     /// Type that represents the target version for serialization. Even though we only specify
     /// `Serialize` as a trait bound here, the concrete type must also implement something we
     /// call "stable serialization": the definition of `Self::Version` may change from one version
@@ -53,20 +18,23 @@ pub trait VersionedSerialize {
     /// expected to forgo the default `Serialize` implementation in these cases, and provide one
     /// that adheres to the aforementioned invariants.
     type Version: Serialize;
+}
 
+/// Implementors of this trait support versioned serialization.
+pub trait VersionedSerialize<'a>: Versioned {
     type S: Serialize;
 
     /// Build a `Self::S` value whose serialized representation is the same as the versioned
     /// serialized representation of `Self` for the provided target version.
-    fn versioned_serialize(&self, target_version: Self::Version) -> Self::S;
+    fn versioned_serialize<'b: 'a>(&'b self, target_version: Self::Version) -> Self::S;
 }
 
 /// Implementors of this trait support versioned deserialization.
-pub trait VersionedDeserialize<'de>: Sized {
-    /// A type that can be deserialized starting from a versioned serialized representation of
-    /// `Self`, and then consumed via `Into` to obtain the associated current version value
-    /// of `Self`.
-    type D: Deserialize<'de> + Into<Self>;
+pub trait VersionedDeserialize: Versioned + Sized {
+    fn versioned_deserialize<'de, D: IndirectDeserialize<'de, Self>>(
+        source_version: Self::Version,
+        d: D,
+    ) -> D::R;
 }
 
 #[cfg(test)]
@@ -76,10 +44,12 @@ mod tests {
     use std::fmt;
 
     use bincode;
-    use serde::de::{Error, MapAccess, SeqAccess, Visitor};
-    use serde::ser::{SerializeStruct, SerializeTuple};
-    use serde::{Deserializer, Serializer};
+    use serde::de::{Deserializer, Error, MapAccess, SeqAccess, Visitor};
+    use serde::ser::{SerializeStruct, Serializer};
+    use serde::Deserialize;
     use serde_json;
+
+    use indirect_de::{MapIndirect, SeqIndirect};
 
     enum AVersion {
         V1,
@@ -124,26 +94,10 @@ mod tests {
 
     impl<'a> Serialize for AS<'a> {
         fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-            // We serialize this as a (version, struct) tuple. Could also add magic numbers, etc.
-            let mut tup = serializer.serialize_tuple(2)?;
-            // Serialize the version.
-            tup.serialize_element(&self.1)?;
-            // Serialize the data for the target version.
-            tup.serialize_element(&ASValue(self.0, &self.1))?;
-            tup.end()
-        }
-    }
-
-    // Internal helper struct. Implements serialization for a value of type A to the provided
-    // target version.
-    struct ASValue<'a>(&'a A, &'a AVersion);
-
-    impl<'a> Serialize for ASValue<'a> {
-        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
             use AVersion::*;
 
             let a = self.0;
-            let target_version = self.1;
+            let target_version = &self.1;
 
             // We'll ideally have tooling support to help generate the following code. The tricky
             // part comes when there's some semantic interpretation required as well. We might
@@ -153,72 +107,23 @@ mod tests {
             match target_version {
                 V1 => {
                     let mut state = serializer.serialize_struct("A", 2)?;
-                    state.serialize_field("b", &(&a.b).versioned_serialize("v1"))?;
-                    state.serialize_field("c", &(&a.c).versioned_serialize("v1"))?;
+                    state.serialize_field("b", &a.b.versioned_serialize("v1"))?;
+                    state.serialize_field("c", &a.c.versioned_serialize("v1"))?;
                     state.end()
                 }
                 V2 => {
                     let mut state = serializer.serialize_struct("A", 2)?;
-                    state.serialize_field("b", &(&a.b).versioned_serialize("v2"))?;
-                    state.serialize_field("c", &(&a.c).versioned_serialize("v2"))?;
+                    state.serialize_field("b", &a.b.versioned_serialize("v2"))?;
+                    state.serialize_field("c", &a.c.versioned_serialize("v2"))?;
                     state.end()
                 }
                 V3 => {
                     let mut state = serializer.serialize_struct("A", 2)?;
-                    state.serialize_field("b", &(&a.b).versioned_serialize("v2"))?;
-                    state.serialize_field("c", &(&a.c).versioned_serialize("v3"))?;
+                    state.serialize_field("b", &a.b.versioned_serialize("v2"))?;
+                    state.serialize_field("c", &a.c.versioned_serialize("v3"))?;
                     state.end()
                 }
             }
-        }
-    }
-
-    struct AD {
-        inner: A,
-    }
-
-    // The deserializer follows the serialization steps in reverse. We first deserialize the
-    // version, and based on that we pick the specific deserialization logic to use.
-    impl<'de> Deserialize<'de> for AD {
-        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-            struct ADVisitor;
-
-            impl<'de> Visitor<'de> for ADVisitor {
-                type Value = A;
-
-                fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                    write!(formatter, "some message here")
-                }
-
-                fn visit_seq<V: SeqAccess<'de>>(self, mut seq: V) -> Result<Self::Value, V::Error> {
-                    use AVersion::*;
-                    let version = seq
-                        .next_element()?
-                        .ok_or(V::Error::missing_field("version"))?;
-                    // The deserialization logic for each (x -> current) version transition
-                    // is implemented by a separate helper type.
-                    Ok(match version {
-                        V1 => {
-                            seq.next_element::<ADV1>()?
-                                .ok_or(V::Error::missing_field("value"))?
-                                .0
-                        }
-                        V2 => unreachable!(),
-                        V3 => unreachable!(),
-                    })
-                }
-            }
-
-            Ok(Self {
-                inner: deserializer.deserialize_tuple(2, ADVisitor)?,
-            })
-        }
-    }
-
-    // Automatically provides `impl Into<A> for A_D` as well.
-    impl From<AD> for A {
-        fn from(source: AD) -> Self {
-            source.inner
         }
     }
 
@@ -253,14 +158,12 @@ mod tests {
                 where
                     V: SeqAccess<'de>,
                 {
-                    let b = seq
-                        .next_element::<<B as VersionedDeserialize>::D>()?
-                        .ok_or_else(|| V::Error::missing_field("b"))?
-                        .into();
-                    let c = seq
-                        .next_element::<<C as VersionedDeserialize>::D>()?
-                        .ok_or_else(|| V::Error::missing_field("c"))?
-                        .into();
+                    let b = B::versioned_deserialize("v1", SeqIndirect(&mut seq))?
+                        .ok_or_else(|| V::Error::missing_field("b"))?;
+
+                    let c = C::versioned_deserialize("v1", SeqIndirect(&mut seq))?
+                        .ok_or_else(|| V::Error::missing_field("c"))?;
+
                     Ok(A { b, c })
                 }
 
@@ -276,17 +179,13 @@ mod tests {
                                 if b.is_some() {
                                     return Err(V::Error::duplicate_field("b"));
                                 }
-                                b = Some(
-                                    map.next_value::<<B as VersionedDeserialize>::D>()?.into(),
-                                );
+                                b = Some(B::versioned_deserialize("v1", MapIndirect(&mut map))?);
                             }
                             Field::C => {
                                 if c.is_some() {
                                     return Err(V::Error::duplicate_field("c"));
                                 }
-                                c = Some(
-                                    map.next_value::<<C as VersionedDeserialize>::D>()?.into(),
-                                );
+                                c = Some(C::versioned_deserialize("v1", MapIndirect(&mut map))?);
                             }
                         }
                     }
@@ -306,17 +205,35 @@ mod tests {
         }
     }
 
-    impl<'a> VersionedSerialize for &'a A {
+    impl From<ADV1> for A {
+        fn from(a: ADV1) -> Self {
+            a.0
+        }
+    }
+
+    impl Versioned for A {
         type Version = AVersion;
+    }
+
+    impl<'a> VersionedSerialize<'a> for A {
         type S = AS<'a>;
 
-        fn versioned_serialize(&self, target_version: Self::Version) -> Self::S {
+        fn versioned_serialize<'b: 'a>(&'b self, target_version: Self::Version) -> Self::S {
             AS(self, target_version)
         }
     }
 
-    impl<'de> VersionedDeserialize<'de> for A {
-        type D = AD;
+    impl VersionedDeserialize for A {
+        fn versioned_deserialize<'de, D: IndirectDeserialize<'de, Self>>(
+            source_version: Self::Version,
+            mut d: D,
+        ) -> D::R {
+            use AVersion::*;
+            match source_version {
+                V1 => d.with_deserialize::<ADV1>(),
+                _ => unreachable!(),
+            }
+        }
     }
 
     // For this dummy examples, types `B` and `C` have trivial implementations of
@@ -336,17 +253,25 @@ mod tests {
         }
     }
 
-    impl<'a> VersionedSerialize for &'a B {
+    impl Versioned for B {
         type Version = &'static str;
+    }
+
+    impl<'a> VersionedSerialize<'a> for B {
         type S = BS<'a>;
 
-        fn versioned_serialize(&self, _target_version: Self::Version) -> Self::S {
+        fn versioned_serialize<'b: 'a>(&'b self, _target_version: Self::Version) -> Self::S {
             BS(self)
         }
     }
 
-    impl<'de> VersionedDeserialize<'de> for B {
-        type D = Self;
+    impl VersionedDeserialize for B {
+        fn versioned_deserialize<'de, D: IndirectDeserialize<'de, Self>>(
+            _source_version: Self::Version,
+            mut d: D,
+        ) -> D::R {
+            d.with_deserialize::<B>()
+        }
     }
 
     #[derive(Debug, Deserialize, PartialEq, Serialize)]
@@ -362,17 +287,25 @@ mod tests {
         }
     }
 
-    impl<'a> VersionedSerialize for &'a C {
+    impl Versioned for C {
         type Version = &'static str;
+    }
+
+    impl<'a> VersionedSerialize<'a> for C {
         type S = CS<'a>;
 
-        fn versioned_serialize(&self, _target_version: Self::Version) -> Self::S {
+        fn versioned_serialize<'b: 'a>(&'b self, _target_version: Self::Version) -> Self::S {
             CS(self)
         }
     }
 
-    impl<'de> VersionedDeserialize<'de> for C {
-        type D = Self;
+    impl VersionedDeserialize for C {
+        fn versioned_deserialize<'de, D: IndirectDeserialize<'de, Self>>(
+            _source_version: Self::Version,
+            mut d: D,
+        ) -> D::R {
+            d.with_deserialize::<C>()
+        }
     }
 
     #[test]
@@ -382,23 +315,37 @@ mod tests {
             c: C { y: 123 },
         };
 
+        struct BincodeIndirect<'b>(&'b [u8]);
+
+        impl<'a, 'b: 'a, T: VersionedDeserialize> IndirectDeserialize<'a, T> for BincodeIndirect<'b> {
+            type R = T;
+
+            fn with_deserialize<D: Deserialize<'a> + Into<T>>(&mut self) -> Self::R {
+                bincode::deserialize::<D>(self.0).unwrap().into()
+            }
+        }
+
+        struct JsonIndirect<'b>(&'b str);
+
+        impl<'a, 'b: 'a, T: VersionedDeserialize> IndirectDeserialize<'a, T> for JsonIndirect<'b> {
+            type R = T;
+
+            fn with_deserialize<D: Deserialize<'a> + Into<T>>(&mut self) -> Self::R {
+                serde_json::from_str::<D>(self.0).unwrap().into()
+            }
+        }
+
         // Trying out bincode.
         {
-            let v = bincode::serialize(&(&a).versioned_serialize(AVersion::V1)).unwrap();
-            let hmm = bincode::deserialize::<<A as VersionedDeserialize>::D>(v.as_slice())
-                .unwrap()
-                .into();
-
+            let v = bincode::serialize(&a.versioned_serialize(AVersion::V1)).unwrap();
+            let hmm = A::versioned_deserialize(AVersion::V1, BincodeIndirect(v.as_slice()));
             assert_eq!(a, hmm);
         }
 
         // Trying out serde-json.
         {
-            let j = serde_json::to_string(&(&a).versioned_serialize(AVersion::V1)).unwrap();
-            let hmm = serde_json::from_str::<<A as VersionedDeserialize>::D>(j.as_str())
-                .unwrap()
-                .into();
-
+            let j = serde_json::to_string(&a.versioned_serialize(AVersion::V1)).unwrap();
+            let hmm = A::versioned_deserialize(AVersion::V1, JsonIndirect(j.as_str()));
             assert_eq!(a, hmm);
         }
     }
