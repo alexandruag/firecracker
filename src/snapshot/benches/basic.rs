@@ -14,20 +14,20 @@ struct Test {
     field_x: u64,
     field0: u64,
     field1: u32,
-    #[snapshot(start_version = 2, default_fn = "field2_default")]
+    #[version(start = 2, default_fn = "field2_default")]
     field2: u64,
-    #[snapshot(
-        start_version = 3,
+    #[version(
+        start = 3,
         default_fn = "field3_default",
-        semantic_ser_fn = "field3_serialize",
-        semantic_de_fn = "field3_deserialize"
+        ser_fn = "field3_serialize",
+        de_fn = "field3_deserialize"
     )]
     field3: String,
-    #[snapshot(
-        start_version = 4,
+    #[version(
+        start = 4,
         default_fn = "field4_default",
-        semantic_ser_fn = "field4_serialize",
-        semantic_de_fn = "field4_deserialize"
+        ser_fn = "field4_serialize",
+        de_fn = "field4_deserialize"
     )]
     field4: Vec<u64>,
 }
@@ -158,11 +158,11 @@ pub fn criterion_benchmark(c: &mut Criterion) {
     let mut vm = VersionMap::new();
 
     vm.new_version()
-        .set_type_version(Test::name(), 2)
+        .set_type_version(Test::type_id(), 2)
         .new_version()
-        .set_type_version(Test::name(), 3)
+        .set_type_version(Test::type_id(), 3)
         .new_version()
-        .set_type_version(Test::name(), 4);
+        .set_type_version(Test::type_id(), 4);
 
     let mut snapshot_len = bench_snapshot_v1(&mut snapshot_mem.as_mut_slice(), vm.clone());
     println!("Snapshot len {}", snapshot_len);

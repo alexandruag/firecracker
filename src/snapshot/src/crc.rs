@@ -4,6 +4,7 @@
 use crc64::crc64;
 use std::io::{Read, Write};
 
+/// Computes CRC64 checksums from read bytes.
 pub(crate) struct CRC64Reader<T> {
     reader: T,
     crc64: u64,
@@ -33,6 +34,7 @@ where
     }
 }
 
+/// Computes CRC64 checksums from written bytes.
 pub(crate) struct CRC64Writer<T> {
     writer: T,
     crc64: u64,
@@ -66,6 +68,7 @@ where
     }
 }
 
+#[cfg(test)]
 mod tests {
     use super::{CRC64Reader, CRC64Writer, Read, Write};
 

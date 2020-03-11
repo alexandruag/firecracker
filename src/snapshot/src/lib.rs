@@ -1,5 +1,45 @@
 // Copyright 2020 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
+#![deny(missing_docs)]
+
+//! Provides version tolerant serialization and deserialization facilities and
+//! implements a persistent storage format for Firecracker state snapshots.
+//!
+//! The `Versionize` trait defines a generic interface that serializable state structures
+//! need to implement.
+//!
+//! The `Snapshot` API manages serialization and deserialization of collections of objects
+//! that implement the `Versionize` trait. Each object is stored in a separate section
+//! that can be save/loaded independently:
+//!
+//!  |----------------------------|
+//!  |       64 bit magic_id      |
+//!  |----------------------------|
+//!  |         SnapshotHdr        |
+//!  |----------------------------|
+//!  |         Section  #1        |
+//!  |----------------------------|
+//!  |         Section  #2        |
+//!  |----------------------------|
+//!  |         Section  #3        |
+//!  |----------------------------|
+//!  |          ..........        |
+//!  |----------------------------|
+//!  |        optional CRC64      |
+//!  |----------------------------|
+//!
+//! Each structure, union or enum is versioned separately and only need to increment their version
+//! if a field is added or removed. For each state snapshot we define 2 versions:
+//!  - **the format version** which refers to the SnapshotHdr, Section headers, CRC, or the
+//! representation of primitives types (currentl we use serde bincode as a backend). The current
+//! implementation does not have any logic dependent on it.
+//!  - **the data version** which refers to the state stored in all of the snapshot sections.
+//!
+//! The `VersionMap` exposes an API that maps the individual structure versions to
+//! a root version (see above: the data version for example). This mapping is required
+//! both when serializing or deserializing structures as we need to know which version of structure
+//! to serialize for a given target **data version
+//!
 
 extern crate bincode;
 extern crate crc64;
@@ -8,15 +48,14 @@ extern crate serde_derive;
 extern crate snapshot_derive;
 extern crate vmm_sys_util;
 
-pub mod crc;
-pub mod primitives;
+mod crc;
+mod primitives;
 pub mod version_map;
 
 use crc::{CRC64Reader, CRC64Writer};
-use serde_derive::{Deserialize, Serialize};
 use snapshot_derive::Versionize;
+use std::any::TypeId;
 use std::collections::hash_map::HashMap;
-use std::fmt;
 use std::io::{Read, Write};
 use version_map::VersionMap;
 
@@ -27,36 +66,8 @@ const BASE_MAGIC_ID_MASK: u64 = !0xFFFFu64;
 
 #[cfg(target_arch = "x86_64")]
 const BASE_MAGIC_ID: u64 = 0x0710_1984_8664_0000u64;
-
 #[cfg(target_arch = "aarch64")]
 const BASE_MAGIC_ID: u64 = 0x0710_1984_AAAA_0000u64;
-
-// Returns format version if arch id is valid.
-// Returns none otherwise.
-fn validate_magic_id(magic_id: u64) -> Option<u16> {
-    let magic_arch = magic_id & BASE_MAGIC_ID_MASK;
-    if magic_arch == BASE_MAGIC_ID {
-        return Some((magic_id & !BASE_MAGIC_ID_MASK) as u16);
-    }
-    None
-}
-
-fn build_magic_id(format_version: u16) -> u64 {
-    BASE_MAGIC_ID | format_version as u64
-}
-
-/// Firecracker snapshot format.
-///  
-///  |----------------------------|
-///  |         SnapshotHdr        |
-///  |----------------------------|
-///  |         Section  #1        |
-///  |----------------------------|
-///  |         Section  #2        |
-///  |----------------------------|
-///  |         Section  #3        |
-///  |----------------------------|
-///             ..........
 
 #[derive(Default, Debug, Versionize)]
 struct SnapshotHdr {
@@ -66,6 +77,8 @@ struct SnapshotHdr {
     section_count: u16,
 }
 
+/// The `Snapshot` API manages serialization and deserialization of collections of objects
+/// that implement the `Versionize` trait.
 #[derive(Debug)]
 pub struct Snapshot {
     hdr: SnapshotHdr,
@@ -77,73 +90,79 @@ pub struct Snapshot {
 }
 
 #[derive(Default, Debug, Versionize)]
-pub struct Section {
+struct Section {
     name: String,
     data: Vec<u8>,
 }
 
-#[derive(PartialEq)]
+/// Snapshot API errors.
+#[derive(PartialEq, Debug)]
 pub enum Error {
+    /// An IO error occured.
     Io(i32),
+    /// A serialization error.
     Serialize(String),
+    /// A deserialization error.
     Deserialize(String),
+    /// A user generated semantic error.
     Semantic(String),
+    /// CRC64 validation failed.
     Crc64,
+    /// Magic value does not match arch.
+    InvalidMagic(u64),
 }
 
+/// Snapshot specific result type.
 pub type Result<T> = std::result::Result<T, Error>;
 
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            Error::Io(ref err) => write!(f, "IO error: {}", err),
-            Error::Serialize(ref err) => write!(f, "Serialization error: {}", err),
-            Error::Deserialize(ref err) => write!(f, "Deserialization error: {}", err),
-            Error::Semantic(ref err) => write!(f, "Semantic error: {}", err),
-            Error::Crc64 => write!(f, "Crc64 check failed"),
-        }
+// Returns format version if arch id is valid.
+// Returns none otherwise.
+fn validate_magic_id(magic_id: u64) -> Result<u16> {
+    let magic_arch = magic_id & BASE_MAGIC_ID_MASK;
+    if magic_arch == BASE_MAGIC_ID {
+        return Ok((magic_id & !BASE_MAGIC_ID_MASK) as u16);
     }
+    Err(Error::InvalidMagic(magic_id))
 }
 
-impl fmt::Debug for Error {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            Error::Io(ref err) => write!(f, "IO error: {}", err),
-            Error::Serialize(ref err) => write!(f, "Serialization error: {}", err),
-            Error::Deserialize(ref err) => write!(f, "Deserialization error: {}", err),
-            Error::Semantic(ref err) => write!(f, "Semantic error: {}", err),
-            Error::Crc64 => write!(f, "Crc64 check failed"),
-        }
-    }
+fn build_magic_id(format_version: u16) -> u64 {
+    BASE_MAGIC_ID | format_version as u64
 }
 
-/// Trait that provides an implementation to deconstruct/restore structs
-/// into typed fields backed by the Snapshot storage.
-/// This trait is automatically implemented on user specified structs
-/// or otherwise manually implemented.
+/// Trait that provides an interface for version aware serialization and deserialization.
 pub trait Versionize {
+    /// Serializes `self` to `target_verion` using the specficifed `writer` and `version_map`.
     fn serialize<W: Write>(
         &self,
         writer: &mut W,
         version_map: &VersionMap,
-        target_app_version: u16,
+        target_version: u16,
     ) -> Result<()>;
 
+    /// Returns a new instance of `Self` by deserialzing from `source_version` using the
+    /// specficifed `reader` and `version_map`.
     fn deserialize<R: Read>(
         reader: &mut R,
         version_map: &VersionMap,
-        src_app_version: u16,
+        source_version: u16,
     ) -> Result<Self>
     where
         Self: Sized;
 
-    fn name() -> String;
-    // Returns latest struct version.
+    /// Returns the `Self` type id.
+    fn type_id() -> std::any::TypeId
+    where
+        Self: 'static,
+    {
+        TypeId::of::<Self>()
+    }
+
+    /// Returns latest `Self` version number.
     fn version() -> u16;
 }
 
 impl Snapshot {
-    // Creates a new instance which can only be used to save a new snapshot.
+    /// Creates a new instance which can only be used to save a new snapshot.
     pub fn new(version_map: VersionMap, target_version: u16) -> Snapshot {
         Snapshot {
             version_map,
@@ -154,7 +173,7 @@ impl Snapshot {
         }
     }
 
-    // Loads an existing snapshot.
+    /// Attempts to loads an existing snapshot.
     pub fn load<T>(mut reader: &mut T, version_map: VersionMap) -> Result<Snapshot>
     where
         T: Read,
@@ -185,18 +204,18 @@ impl Snapshot {
         })
     }
 
-    // Loads an existing snapshot and validates CRC 64.
+    /// Attempts to loads an existing snapshot and validate CRC.
     pub fn load_with_crc64<T>(reader: &mut T, version_map: VersionMap) -> Result<Snapshot>
     where
         T: Read,
     {
         let mut crc_reader = CRC64Reader::new(reader);
+        let format_vm = Self::format_version_map();
 
         // Read entire buffer in memory.
-        let snapshot = Snapshot::load(&mut crc_reader, version_map.clone())?;
+        let snapshot = Snapshot::load(&mut crc_reader, version_map)?;
         let computed_checksum = crc_reader.checksum();
-        let stored_checksum: u64 =
-            Versionize::deserialize(&mut crc_reader, &snapshot.version_map, 0)?;
+        let stored_checksum: u64 = Versionize::deserialize(&mut crc_reader, &format_vm, 0)?;
 
         if computed_checksum != stored_checksum {
             println!(
@@ -209,6 +228,7 @@ impl Snapshot {
         Ok(snapshot)
     }
 
+    /// Saves a snapshot and include a CRC64 checksum.
     pub fn save_with_crc64<T>(&mut self, writer: &mut T) -> Result<()>
     where
         T: std::io::Write,
@@ -221,7 +241,7 @@ impl Snapshot {
         Ok(())
     }
 
-    // Save a snapshot.
+    /// Save a snapshot.
     pub fn save<T>(&mut self, mut writer: &mut T) -> Result<()>
     where
         T: std::io::Write,
@@ -232,7 +252,7 @@ impl Snapshot {
         };
 
         let format_version_map = Self::format_version_map();
-        let magic_id = build_magic_id(format_version_map.get_latest_version());
+        let magic_id = build_magic_id(format_version_map.latest_version());
 
         // Serialize magic id using the format version map.
         magic_id.serialize(&mut writer, &format_version_map, 0 /* unused */)?;
@@ -240,16 +260,16 @@ impl Snapshot {
         self.hdr.serialize(
             &mut writer,
             &format_version_map,
-            format_version_map.get_latest_version(),
+            format_version_map.latest_version(),
         )?;
 
         // Serialize all the sections.
-        for (_, section) in &self.sections {
+        for section in self.sections.values() {
             // The sections are already serialized.
             section.serialize(
                 &mut writer,
                 &format_version_map,
-                format_version_map.get_latest_version(),
+                format_version_map.latest_version(),
             )?;
         }
         writer
@@ -259,7 +279,7 @@ impl Snapshot {
         Ok(())
     }
 
-    // Reads a section (deserialize/translate) from a snapshot.
+    /// Attempts to find and reads a section (deserialize/translate) from a snapshot.
     pub fn read_section<T>(&mut self, name: &str) -> Result<Option<T>>
     where
         T: Versionize,
@@ -275,7 +295,7 @@ impl Snapshot {
         Ok(None)
     }
 
-    // Write a section (serialize/translate) to a snapshot.
+    /// Write a section (serialize/translate) to a snapshot.
     pub fn write_section<T>(&mut self, name: &str, object: &T) -> Result<usize>
     where
         T: Versionize,
@@ -306,27 +326,44 @@ impl Snapshot {
     }
 }
 
+#[cfg(test)]
 mod tests {
     #![allow(non_upper_case_globals)]
     #![allow(non_camel_case_types)]
     #![allow(non_snake_case)]
     use super::*;
-    pub type __s8 = ::std::os::raw::c_schar;
-    pub type __u8 = ::std::os::raw::c_uchar;
-    pub type __s16 = ::std::os::raw::c_short;
-    pub type __u16 = ::std::os::raw::c_ushort;
-    pub type __s32 = ::std::os::raw::c_int;
-    pub type __u32 = ::std::os::raw::c_uint;
-    pub type __s64 = ::std::os::raw::c_longlong;
-    pub type __u64 = ::std::os::raw::c_ulonglong;
+    use serde_derive::{Deserialize, Serialize};
+
+    static basic_add_remove_field_v1: &[u8] = &[
+        0x01, 0x00, 0x64, 0x86, 0x84, 0x19, 0x10, 0x07, 0x01, 0x00, 0x01, 0x00, 0x04, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x74, 0x65, 0x73, 0x74, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0xD2, 0x04, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x74,
+        0x65, 0x73, 0x74, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+
+    static basic_add_remove_field_v2: &[u8] = &[
+        0x01, 0x00, 0x64, 0x86, 0x84, 0x19, 0x10, 0x07, 0x02, 0x00, 0x01, 0x00, 0x04, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x74, 0x65, 0x73, 0x74, 0x21, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x74, 0x65, 0x73, 0x74, 0x05,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x62, 0x61, 0x73, 0x69, 0x63, 0x14, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+
+    static basic_add_remove_field_v3: &[u8] = &[
+        0x01, 0x00, 0x64, 0x86, 0x84, 0x19, 0x10, 0x07, 0x03, 0x00, 0x01, 0x00, 0x04, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x74, 0x65, 0x73, 0x74, 0x29, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x74, 0x65, 0x73, 0x74, 0x05,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x62, 0x61, 0x73, 0x69, 0x63, 0xD2, 0x04, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
 
     #[repr(u32)]
     #[derive(Debug, Versionize, Serialize, Deserialize, PartialEq, Clone)]
     pub enum TestState {
         One = 1,
-        #[snapshot(start_version = 2, default_fn = "test_state_default_one")]
+        #[version(start = 2, default_fn = "test_state_default_one")]
         Two = 2,
-        #[snapshot(start_version = 3, default_fn = "test_state_default_two")]
+        #[version(start = 3, default_fn = "test_state_default_two")]
         Three = 3,
     }
 
@@ -367,20 +404,20 @@ mod tests {
         field_x: u64,
         field0: u64,
         field1: u32,
-        #[snapshot(start_version = 2, default_fn = "field2_default")]
+        #[version(start = 2, default_fn = "field2_default")]
         field2: u64,
-        #[snapshot(
-            start_version = 3,
+        #[version(
+            start = 3,
             default_fn = "field3_default",
-            semantic_ser_fn = "field3_serialize",
-            semantic_de_fn = "field3_deserialize"
+            ser_fn = "field3_serialize",
+            de_fn = "field3_deserialize"
         )]
         field3: String,
-        #[snapshot(
-            start_version = 4,
+        #[version(
+            start = 4,
             default_fn = "field4_default",
-            semantic_ser_fn = "field4_serialize",
-            semantic_de_fn = "field4_deserialize"
+            ser_fn = "field4_serialize",
+            de_fn = "field4_deserialize"
         )]
         field4: Vec<u64>,
     }
@@ -434,11 +471,11 @@ mod tests {
     fn test_struct_semantic_fn() {
         let mut vm = VersionMap::new();
         vm.new_version()
-            .set_type_version(Test::name(), 2)
+            .set_type_version(Test::type_id(), 2)
             .new_version()
-            .set_type_version(Test::name(), 3)
+            .set_type_version(Test::type_id(), 3)
             .new_version()
-            .set_type_version(Test::name(), 4);
+            .set_type_version(Test::type_id(), 4);
         let state = Test {
             field0: 0,
             field1: 1,
@@ -493,11 +530,11 @@ mod tests {
     fn test_semantic_serialize_error() {
         let mut vm = VersionMap::new();
         vm.new_version()
-            .set_type_version(Test::name(), 2)
+            .set_type_version(Test::type_id(), 2)
             .new_version()
-            .set_type_version(Test::name(), 3)
+            .set_type_version(Test::type_id(), 3)
             .new_version()
-            .set_type_version(Test::name(), 4);
+            .set_type_version(Test::type_id(), 4);
 
         let state = Test {
             field0: 0,
@@ -524,11 +561,11 @@ mod tests {
     fn test_semantic_deserialize_error() {
         let mut vm = VersionMap::new();
         vm.new_version()
-            .set_type_version(Test::name(), 2)
+            .set_type_version(Test::type_id(), 2)
             .new_version()
-            .set_type_version(Test::name(), 3)
+            .set_type_version(Test::type_id(), 3)
             .new_version()
-            .set_type_version(Test::name(), 4);
+            .set_type_version(Test::type_id(), 4);
 
         let state = Test {
             field0: 6666,
@@ -572,7 +609,10 @@ mod tests {
         assert!(snapshot.write_section("test", &state_1).is_ok());
         assert_eq!(
             snapshot.save(&mut snapshot_mem.as_mut_slice()).unwrap_err(),
-            Error::Serialize("io error: failed to write whole buffer".to_owned())
+            Error::Serialize(
+                "Io(Custom { kind: WriteZero, error: \"failed to write whole buffer\" })"
+                    .to_owned()
+            )
         );
     }
 
@@ -626,11 +666,11 @@ mod tests {
     fn test_deserialize_error() {
         let mut vm = VersionMap::new();
         vm.new_version()
-            .set_type_version(Test::name(), 2)
+            .set_type_version(Test::type_id(), 2)
             .new_version()
-            .set_type_version(Test::name(), 3)
+            .set_type_version(Test::type_id(), 3)
             .new_version()
-            .set_type_version(Test::name(), 4);
+            .set_type_version(Test::type_id(), 4);
         let state = Test {
             field0: 0,
             field1: 1,
@@ -652,7 +692,10 @@ mod tests {
             Snapshot::load(&mut snapshot_mem.as_slice(), vm.clone()).unwrap_err();
         assert_eq!(
             snapshot_load_error,
-            Error::Deserialize("io error: failed to fill whole buffer".to_owned())
+            Error::Deserialize(
+                "Io(Custom { kind: UnexpectedEof, error: \"failed to fill whole buffer\" })"
+                    .to_owned()
+            )
         );
     }
 
@@ -660,11 +703,11 @@ mod tests {
     fn test_struct_default_fn() {
         let mut vm = VersionMap::new();
         vm.new_version()
-            .set_type_version(Test::name(), 2)
+            .set_type_version(Test::type_id(), 2)
             .new_version()
-            .set_type_version(Test::name(), 3)
+            .set_type_version(Test::type_id(), 3)
             .new_version()
-            .set_type_version(Test::name(), 4);
+            .set_type_version(Test::type_id(), 4);
         let state = Test {
             field0: 0,
             field1: 1,
@@ -732,16 +775,16 @@ mod tests {
         #[repr(C)]
         #[derive(Versionize, Copy, Clone)]
         union kvm_irq_level__bindgen_ty_1 {
-            pub irq: __u32,
-            pub status: __s32,
+            pub irq: ::std::os::raw::c_uint,
+            pub status: ::std::os::raw::c_int,
 
-            #[snapshot(start_version = 1, end_version = 1)]
+            #[version(start = 1, end = 1)]
             _bindgen_union_align: u32,
 
-            #[snapshot(start_version = 2)]
-            pub extended_status: __s64,
+            #[version(start = 2)]
+            pub extended_status: ::std::os::raw::c_longlong,
 
-            #[snapshot(start_version = 2)]
+            #[version(start = 2)]
             _bindgen_union_align_2: [u64; 4usize],
         }
 
@@ -775,8 +818,8 @@ mod tests {
         #[repr(C)]
         #[derive(Versionize, Debug, Default, Copy, Clone, PartialEq)]
         pub struct kvm_pit_config {
-            pub flags: __u32,
-            pub pad: [__u32; 15usize],
+            pub flags: ::std::os::raw::c_uint,
+            pub pad: [::std::os::raw::c_uint; 15usize],
         }
 
         let state = kvm_pit_config {
@@ -805,12 +848,12 @@ mod tests {
     fn test_basic_add_remove_field() {
         #[derive(Versionize, Debug, PartialEq, Clone)]
         pub struct A {
-            #[snapshot(start_version = 1, end_version = 2)]
+            #[version(start = 1, end = 2)]
             x: u32,
             y: String,
-            #[snapshot(start_version = 2, default_fn = "default_A_z")]
+            #[version(start = 2, default_fn = "default_A_z")]
             z: String,
-            #[snapshot(start_version = 3, semantic_ser_fn = "semantic_x")]
+            #[version(start = 3, ser_fn = "semantic_x")]
             q: u64,
         }
 
@@ -833,9 +876,9 @@ mod tests {
 
         let mut vm = VersionMap::new();
         vm.new_version()
-            .set_type_version(A::name(), 2)
+            .set_type_version(A::type_id(), 2)
             .new_version()
-            .set_type_version(A::name(), 3);
+            .set_type_version(A::type_id(), 3);
 
         // The blobs have been serialized from this state:
         // let state = B {
@@ -847,8 +890,8 @@ mod tests {
         //     },
         //     b: 20,
         // };
-        let mut snapshot_blob = std::fs::File::open("blobs/basic_add_remove_field_v1.bin").unwrap();
 
+        let mut snapshot_blob = basic_add_remove_field_v1;
         let mut snapshot = Snapshot::load(&mut snapshot_blob, vm.clone()).unwrap();
         let mut restored_state = snapshot.read_section::<B>("test").unwrap().unwrap();
         println!("State: {:?}", restored_state);
@@ -856,7 +899,7 @@ mod tests {
         assert_eq!(restored_state.a.x, 1234);
         assert_eq!(restored_state.a.z, stringify!(whatever));
 
-        snapshot_blob = std::fs::File::open("blobs/basic_add_remove_field_v2.bin").unwrap();
+        snapshot_blob = basic_add_remove_field_v2;
         snapshot = Snapshot::load(&mut snapshot_blob, vm.clone()).unwrap();
         restored_state = snapshot.read_section::<B>("test").unwrap().unwrap();
         println!("State: {:?}", restored_state);
@@ -864,8 +907,8 @@ mod tests {
         assert_eq!(restored_state.a.x, 0);
         // z field was added in version to, make sure it contains the original value
         assert_eq!(restored_state.a.z, stringify!(basic));
-       
-        snapshot_blob = std::fs::File::open("blobs/basic_add_remove_field_v3.bin").unwrap();
+
+        snapshot_blob = basic_add_remove_field_v3;
         snapshot = Snapshot::load(&mut snapshot_blob, vm.clone()).unwrap();
         restored_state = snapshot.read_section::<B>("test").unwrap().unwrap();
         println!("State: {:?}", restored_state);

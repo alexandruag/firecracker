@@ -1,9 +1,10 @@
 // Copyright 2020 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use common::{get_end_version, get_ident_attr, get_start_version, parse_field_attributes, Exists};
+use super::super::DEFAULT_FN;
+use common::Exists;
+use helpers::{get_end_version, get_ident_attr, get_start_version, parse_field_attributes};
 use quote::quote;
-use super::{DEFAULT_FN};
 use std::collections::hash_map::HashMap;
 
 #[derive(Debug, Eq, PartialEq, Clone)]
@@ -27,22 +28,14 @@ impl Exists for EnumVariant {
 
 impl EnumVariant {
     pub fn new(base_version: u16, ast_variant: &syn::Variant) -> Self {
-        let mut variant = EnumVariant {
-            ident: ast_variant.ident.clone(),
-            discriminant: 0,
-            // Set base version.
-            start_version: base_version,
-            end_version: 0,
-            attrs: HashMap::new(),
-        };
-
-        // Get variant discriminant as u16.
-        if let Some(discriminant) = &ast_variant.discriminant {
+        let discriminant: u16;
+        if let Some(discriminant_expr) = &ast_variant.discriminant {
             // We only support ExprLit
-            match &discriminant.1 {
+            match &discriminant_expr.1 {
                 syn::Expr::Lit(lit_expr) => match &lit_expr.lit {
                     syn::Lit::Int(lit_int) => {
-                        variant.discriminant = lit_int.base10_parse().unwrap()
+                        // Get variant discriminant as u16.
+                        discriminant = lit_int.base10_parse().unwrap()
                     }
                     _ => panic!("A u16 discriminant is required for versioning Enums."),
                 },
@@ -52,10 +45,15 @@ impl EnumVariant {
             panic!("A u16 discriminant is required for versioning Enums.")
         }
 
-        parse_field_attributes(&mut variant.attrs, &ast_variant.attrs);
-        variant.start_version = get_start_version(&variant.attrs).unwrap_or(base_version);
-        variant.end_version = get_end_version(&variant.attrs).unwrap_or_default();
-        variant
+        let attrs = parse_field_attributes(&ast_variant.attrs);
+        EnumVariant {
+            ident: ast_variant.ident.clone(),
+            discriminant,
+            // Set base version.
+            start_version: get_start_version(&attrs).unwrap_or(base_version),
+            end_version: get_end_version(&attrs).unwrap_or_default(),
+            attrs,
+        }
     }
 
     // Emits code that serializes an enum variant.
@@ -67,7 +65,7 @@ impl EnumVariant {
                 return quote! {
                     Self::#field_ident => {
                         let variant = self.#default_fn_ident(version);
-                        bincode::serialize_into(writer, &variant).map_err(|ref err| Error::Serialize(format!("{}", err)))?;
+                        bincode::serialize_into(writer, &variant).map_err(|ref err| Error::Serialize(format!("{:?}", err)))?;
                     },
                 };
             } else {
@@ -77,7 +75,7 @@ impl EnumVariant {
 
         quote! {
             Self::#field_ident => {
-                bincode::serialize_into(writer, &self).map_err(|ref err| Error::Serialize(format!("{}", err)))?;
+                bincode::serialize_into(writer, &self).map_err(|ref err| Error::Serialize(format!("{:?}", err)))?;
             },
         }
     }

@@ -3,8 +3,12 @@
 
 use self::super::{Error, Result, VersionMap, Versionize};
 use vmm_sys_util::fam::{FamStruct, FamStructWrapper};
-use vmm_sys_util::generate_fam_struct_impl;
 
+/// Implements the Versionize trait for primitive types that also implement
+/// serde's Serialize/Deserialize: use serde_bincode as a backend for
+/// serialization.
+///
+/// !TODO: Implement a backend abstraction layer so we can easily plug in different backends.
 macro_rules! impl_versionize {
     ($ty:ident) => {
         impl Versionize for $ty {
@@ -16,7 +20,7 @@ macro_rules! impl_versionize {
                 _version: u16,
             ) -> Result<()> {
                 bincode::serialize_into(writer, &self)
-                    .map_err(|ref err| Error::Serialize(format!("{}", err)))?;
+                    .map_err(|ref err| Error::Serialize(format!("{:?}", err)))?;
                 Ok(())
             }
             #[inline]
@@ -29,13 +33,9 @@ macro_rules! impl_versionize {
                 Self: Sized,
             {
                 Ok(bincode::deserialize_from(&mut reader)
-                    .map_err(|ref err| Error::Deserialize(format!("{}", err)))?)
+                    .map_err(|ref err| Error::Deserialize(format!("{:?}", err)))?)
             }
 
-            // Not used.
-            fn name() -> String {
-                String::new()
-            }
             // Not used.
             fn version() -> u16 {
                 1
@@ -60,7 +60,6 @@ impl_versionize!(f64);
 impl_versionize!(char);
 impl_versionize!(String);
 
-
 impl<T> Versionize for Vec<T>
 where
     T: Versionize,
@@ -73,12 +72,14 @@ where
         app_version: u16,
     ) -> Result<()> {
         // Serialize in the same fashion as bincode:
-        // len, T, T, ...
+        // Write len.
         bincode::serialize_into(&mut writer, &self.len())
-            .map_err(|ref err| Error::Serialize(format!("{}", err)))?;
-        for obj in self {
-            obj.serialize(writer, version_map, app_version)
-                .map_err(|ref err| Error::Serialize(format!("{}", err)))?;
+            .map_err(|ref err| Error::Serialize(format!("{:?}", err)))?;
+        // Walk the vec and write each elemenet.
+        for element in self {
+            element
+                .serialize(writer, version_map, app_version)
+                .map_err(|ref err| Error::Serialize(format!("{:?}", err)))?;
         }
         Ok(())
     }
@@ -91,26 +92,22 @@ where
     ) -> Result<Self> {
         let mut v = Vec::new();
         let len: u64 = bincode::deserialize_from(&mut reader)
-            .map_err(|ref err| Error::Deserialize(format!("{}", err)))?;
+            .map_err(|ref err| Error::Deserialize(format!("{:?}", err)))?;
         for _ in 0..len {
-            let obj: T = T::deserialize(reader, version_map, app_version)
-                .map_err(|ref err| Error::Deserialize(format!("{}", err)))?;
-            v.push(obj);
+            let element: T = T::deserialize(reader, version_map, app_version)
+                .map_err(|ref err| Error::Deserialize(format!("{:?}", err)))?;
+            v.push(element);
         }
         Ok(v)
     }
 
-    // Not used.
-    fn name() -> String {
-        String::new()
-    }
-
-    // Not used.
+    // Not used yet.
     fn version() -> u16 {
         1
     }
 }
 
+// Implement versioning for FAM structures by using the FamStructWrapper interface.
 impl<T: Default + FamStruct + Versionize> Versionize for FamStructWrapper<T>
 where
     <T as FamStruct>::Entry: Versionize,
@@ -123,8 +120,10 @@ where
         version_map: &VersionMap,
         app_version: u16,
     ) -> Result<()> {
+        // Write the fixed size header.
         self.as_fam_struct_ref()
             .serialize(&mut writer, version_map, app_version)?;
+        // Write the array.
         self.as_slice()
             .to_vec()
             .serialize(&mut writer, version_map, app_version)?;
@@ -139,18 +138,16 @@ where
         app_version: u16,
     ) -> Result<Self> {
         let header = T::deserialize(reader, version_map, app_version)
-            .map_err(|ref err| Error::Deserialize(format!("{}", err)))?;
+            .map_err(|ref err| Error::Deserialize(format!("{:?}", err)))?;
         let entries: Vec<<T as FamStruct>::Entry> =
             Vec::deserialize(reader, version_map, app_version)
-                .map_err(|ref err| Error::Deserialize(format!("{}", err)))?;
+                .map_err(|ref err| Error::Deserialize(format!("{:?}", err)))?;
+        // Construct the object from the array items.
+        // Header(T) fields will be initialized by Default trait impl.
         let mut object = FamStructWrapper::from_entries(&entries);
+        // Update Default T with the deserialized header.
         std::mem::replace(object.as_mut_fam_struct(), header);
         Ok(object)
-    }
-
-    // Not used.
-    fn name() -> String {
-        String::new()
     }
 
     // Not used.
@@ -159,12 +156,14 @@ where
     }
 }
 
+#[cfg(test)]
 mod tests {
     #![allow(non_upper_case_globals)]
     #![allow(non_camel_case_types)]
     #![allow(non_snake_case)]
     use super::super::{Result, Snapshot, VersionMap, Versionize};
     use super::*;
+    use vmm_sys_util::generate_fam_struct_impl;
 
     #[repr(C)]
     #[derive(Default, Debug, Versionize)]
@@ -172,7 +171,7 @@ mod tests {
         pub len: u32,
         pub padding: u32,
         pub value: u32,
-        #[snapshot(start_version = 2, default_fn = "default_extra_value")]
+        #[version(start = 2, default_fn = "default_extra_value")]
         pub extra_value: u16,
         pub entries: __IncompleteArrayField<u32>,
     }
@@ -355,11 +354,6 @@ mod tests {
             _app_version: u16,
         ) -> Result<Self> {
             Ok(Self::new())
-        }
-
-        // Not used.
-        fn name() -> String {
-            String::new()
         }
 
         // Not used.
