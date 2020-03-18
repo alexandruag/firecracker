@@ -41,13 +41,6 @@
 //! to serialize for a given target **data version
 //!
 
-extern crate bincode;
-extern crate crc64;
-extern crate serde;
-extern crate serde_derive;
-extern crate snapshot_derive;
-extern crate vmm_sys_util;
-
 mod crc;
 mod primitives;
 pub mod version_map;
@@ -58,6 +51,28 @@ use std::any::TypeId;
 use std::collections::hash_map::HashMap;
 use std::io::{Read, Write};
 use version_map::VersionMap;
+
+use lazy_static::lazy_static;
+
+lazy_static! {
+    static ref VERSION_MAP: VersionMap = {
+        #[cfg(test)]
+        {
+            let mut vm = VersionMap::new();
+            vm.new_version()
+                .set_type_version(TypeId::of::<tests::Test>(), 2)
+                .set_type_version(TypeId::of::<tests::A>(), 2)
+                .new_version()
+                .set_type_version(TypeId::of::<tests::Test>(), 3)
+                .set_type_version(TypeId::of::<tests::A>(), 3)
+                .new_version()
+                .set_type_version(TypeId::of::<tests::Test>(), 4);
+            vm
+        }
+        #[cfg(not(test))]
+        VersionMap::new()
+    };
+}
 
 // 256k max section size.
 const SNAPSHOT_MAX_SECTION_SIZE: usize = 0x40000;
@@ -132,20 +147,11 @@ fn build_magic_id(format_version: u16) -> u64 {
 /// Trait that provides an interface for version aware serialization and deserialization.
 pub trait Versionize {
     /// Serializes `self` to `target_verion` using the specficifed `writer` and `version_map`.
-    fn serialize<W: Write>(
-        &self,
-        writer: &mut W,
-        version_map: &VersionMap,
-        target_version: u16,
-    ) -> Result<()>;
+    fn serialize<W: Write>(&self, writer: &mut W, target_version: u16) -> Result<()>;
 
     /// Returns a new instance of `Self` by deserialzing from `source_version` using the
     /// specficifed `reader` and `version_map`.
-    fn deserialize<R: Read>(
-        reader: &mut R,
-        version_map: &VersionMap,
-        source_version: u16,
-    ) -> Result<Self>
+    fn deserialize<R: Read>(reader: &mut R, source_version: u16) -> Result<Self>
     where
         Self: Sized;
 
@@ -178,19 +184,13 @@ impl Snapshot {
     where
         T: Read,
     {
-        let format_version_map = Self::format_version_map();
-        let magic_id = <u64 as Versionize>::deserialize(
-            &mut reader,
-            &format_version_map,
-            0, /* unused */
-        )?;
+        let magic_id = <u64 as Versionize>::deserialize(&mut reader, 0 /* unused */)?;
         let format_version = validate_magic_id(magic_id).unwrap();
-        let hdr: SnapshotHdr =
-            SnapshotHdr::deserialize(&mut reader, &format_version_map, format_version)?;
+        let hdr: SnapshotHdr = SnapshotHdr::deserialize(&mut reader, format_version)?;
         let mut sections = HashMap::new();
 
         for _ in 0..hdr.section_count {
-            let section = Section::deserialize(&mut reader, &format_version_map, format_version)?;
+            let section = Section::deserialize(&mut reader, format_version)?;
             sections.insert(section.name.clone(), section);
         }
 
@@ -210,12 +210,11 @@ impl Snapshot {
         T: Read,
     {
         let mut crc_reader = CRC64Reader::new(reader);
-        let format_vm = Self::format_version_map();
 
         // Read entire buffer in memory.
         let snapshot = Snapshot::load(&mut crc_reader, version_map)?;
         let computed_checksum = crc_reader.checksum();
-        let stored_checksum: u64 = Versionize::deserialize(&mut crc_reader, &format_vm, 0)?;
+        let stored_checksum: u64 = Versionize::deserialize(&mut crc_reader, 0)?;
 
         if computed_checksum != stored_checksum {
             println!(
@@ -237,7 +236,7 @@ impl Snapshot {
         self.save(&mut crc_writer)?;
 
         let checksum = crc_writer.checksum();
-        checksum.serialize(&mut crc_writer, &Self::format_version_map(), 0)?;
+        checksum.serialize(&mut crc_writer, 0)?;
         Ok(())
     }
 
@@ -255,22 +254,15 @@ impl Snapshot {
         let magic_id = build_magic_id(format_version_map.latest_version());
 
         // Serialize magic id using the format version map.
-        magic_id.serialize(&mut writer, &format_version_map, 0 /* unused */)?;
+        magic_id.serialize(&mut writer, 0 /* unused */)?;
         // Serialize header using the format version map.
-        self.hdr.serialize(
-            &mut writer,
-            &format_version_map,
-            format_version_map.latest_version(),
-        )?;
+        self.hdr
+            .serialize(&mut writer, format_version_map.latest_version())?;
 
         // Serialize all the sections.
         for section in self.sections.values() {
             // The sections are already serialized.
-            section.serialize(
-                &mut writer,
-                &format_version_map,
-                format_version_map.latest_version(),
-            )?;
+            section.serialize(&mut writer, format_version_map.latest_version())?;
         }
         writer
             .flush()
@@ -288,7 +280,6 @@ impl Snapshot {
             let section = &mut self.sections.get_mut(name).unwrap();
             return Ok(Some(T::deserialize(
                 &mut section.data.as_mut_slice().as_ref(),
-                &self.version_map,
                 self.hdr.data_version,
             )?));
         }
@@ -306,7 +297,7 @@ impl Snapshot {
         };
 
         let slice = &mut new_section.data.as_mut_slice();
-        object.serialize(slice, &self.version_map, self.target_version)?;
+        object.serialize(slice, self.target_version)?;
         // Resize vec to serialized section len.
         let serialized_len =
             slice.as_ptr() as usize - new_section.data.as_slice().as_ptr() as usize;
@@ -844,36 +835,36 @@ mod tests {
         assert_eq!(restored_state, state);
     }
 
+    #[derive(Versionize, Debug, PartialEq, Clone)]
+    pub struct A {
+        #[version(start = 1, end = 2)]
+        x: u32,
+        y: String,
+        #[version(start = 2, default_fn = "default_A_z")]
+        z: String,
+        #[version(start = 3, ser_fn = "semantic_x")]
+        q: u64,
+    }
+
+    #[derive(Versionize, Debug, PartialEq, Clone)]
+    pub struct B {
+        a: A,
+        b: u64,
+    }
+
+    impl A {
+        fn default_A_z(_source_version: u16) -> String {
+            "whatever".to_owned()
+        }
+
+        fn semantic_x(&mut self, _target_version: u16) -> Result<()> {
+            self.x = self.q as u32;
+            Ok(())
+        }
+    }
+
     #[test]
     fn test_basic_add_remove_field() {
-        #[derive(Versionize, Debug, PartialEq, Clone)]
-        pub struct A {
-            #[version(start = 1, end = 2)]
-            x: u32,
-            y: String,
-            #[version(start = 2, default_fn = "default_A_z")]
-            z: String,
-            #[version(start = 3, ser_fn = "semantic_x")]
-            q: u64,
-        }
-
-        #[derive(Versionize, Debug, PartialEq, Clone)]
-        pub struct B {
-            a: A,
-            b: u64,
-        }
-
-        impl A {
-            fn default_A_z(_source_version: u16) -> String {
-                "whatever".to_owned()
-            }
-
-            fn semantic_x(&mut self, _target_version: u16) -> Result<()> {
-                self.x = self.q as u32;
-                Ok(())
-            }
-        }
-
         let mut vm = VersionMap::new();
         vm.new_version()
             .set_type_version(A::type_id(), 2)

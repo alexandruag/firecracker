@@ -58,14 +58,14 @@ impl UnionField {
         if is_array(&self.ty()) {
             return quote! {
                 unsafe {
-                    Versionize::serialize(&copy_of_self.#field_ident.to_vec(), writer, version_map, app_version)?
+                    Versionize::serialize(&copy_of_self.#field_ident.to_vec(), writer, app_version)?
                 }
             };
         }
 
         quote! {
             unsafe {
-                Versionize::serialize(&copy_of_self.#field_ident, writer, version_map, app_version)?
+                Versionize::serialize(&copy_of_self.#field_ident, writer, app_version)?
             }
         }
     }
@@ -101,7 +101,7 @@ impl UnionField {
                 quote! {
                     unsafe {
                         object.#field_ident = {
-                            let v: Vec<#array_type_token> = <Vec<#array_type_token> as Versionize>::deserialize(&mut reader, version_map, app_version)?;
+                            let v: Vec<#array_type_token> = <Vec<#array_type_token> as Versionize>::deserialize(&mut reader, app_version)?;
                             vec_to_arr_func!(transform_vec, #array_type_token, #array_len);
                             transform_vec(&v)
                         }
@@ -109,10 +109,10 @@ impl UnionField {
                 }
             }
             syn::Type::Path(_) => quote! {
-                unsafe { object.#field_ident = <#ty as Versionize>::deserialize(&mut reader, version_map, app_version)?; }
+                unsafe { object.#field_ident = <#ty as Versionize>::deserialize(&mut reader, app_version)?; }
             },
             syn::Type::Reference(_) => quote! {
-                unsafe { object.#field_ident = <#ty as Versionize>::deserialize(&mut reader, version_map, app_version)?; }
+                unsafe { object.#field_ident = <#ty as Versionize>::deserialize(&mut reader, app_version)?; }
             },
             _ => panic!("Unsupported field type {:?}", self.ty),
         }

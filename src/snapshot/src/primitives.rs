@@ -1,7 +1,7 @@
 // Copyright 2020 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use self::super::{Error, Result, VersionMap, Versionize};
+use self::super::{Error, Result, Versionize};
 use vmm_sys_util::fam::{FamStruct, FamStructWrapper};
 
 /// Implements the Versionize trait for primitive types that also implement
@@ -13,22 +13,13 @@ macro_rules! impl_versionize {
     ($ty:ident) => {
         impl Versionize for $ty {
             #[inline]
-            fn serialize<W: std::io::Write>(
-                &self,
-                writer: &mut W,
-                _version_map: &VersionMap,
-                _version: u16,
-            ) -> Result<()> {
+            fn serialize<W: std::io::Write>(&self, writer: &mut W, _version: u16) -> Result<()> {
                 bincode::serialize_into(writer, &self)
                     .map_err(|ref err| Error::Serialize(format!("{:?}", err)))?;
                 Ok(())
             }
             #[inline]
-            fn deserialize<R: std::io::Read>(
-                mut reader: &mut R,
-                _version_map: &VersionMap,
-                _version: u16,
-            ) -> Result<Self>
+            fn deserialize<R: std::io::Read>(mut reader: &mut R, _version: u16) -> Result<Self>
             where
                 Self: Sized,
             {
@@ -65,12 +56,7 @@ where
     T: Versionize,
 {
     #[inline]
-    fn serialize<W: std::io::Write>(
-        &self,
-        mut writer: &mut W,
-        version_map: &VersionMap,
-        app_version: u16,
-    ) -> Result<()> {
+    fn serialize<W: std::io::Write>(&self, mut writer: &mut W, app_version: u16) -> Result<()> {
         // Serialize in the same fashion as bincode:
         // Write len.
         bincode::serialize_into(&mut writer, &self.len())
@@ -78,23 +64,19 @@ where
         // Walk the vec and write each elemenet.
         for element in self {
             element
-                .serialize(writer, version_map, app_version)
+                .serialize(writer, app_version)
                 .map_err(|ref err| Error::Serialize(format!("{:?}", err)))?;
         }
         Ok(())
     }
 
     #[inline]
-    fn deserialize<R: std::io::Read>(
-        mut reader: &mut R,
-        version_map: &VersionMap,
-        app_version: u16,
-    ) -> Result<Self> {
+    fn deserialize<R: std::io::Read>(mut reader: &mut R, app_version: u16) -> Result<Self> {
         let mut v = Vec::new();
         let len: u64 = bincode::deserialize_from(&mut reader)
             .map_err(|ref err| Error::Deserialize(format!("{:?}", err)))?;
         for _ in 0..len {
-            let element: T = T::deserialize(reader, version_map, app_version)
+            let element: T = T::deserialize(reader, app_version)
                 .map_err(|ref err| Error::Deserialize(format!("{:?}", err)))?;
             v.push(element);
         }
@@ -114,34 +96,24 @@ where
     T: std::fmt::Debug,
 {
     #[inline]
-    fn serialize<W: std::io::Write>(
-        &self,
-        mut writer: &mut W,
-        version_map: &VersionMap,
-        app_version: u16,
-    ) -> Result<()> {
+    fn serialize<W: std::io::Write>(&self, mut writer: &mut W, app_version: u16) -> Result<()> {
         // Write the fixed size header.
         self.as_fam_struct_ref()
-            .serialize(&mut writer, version_map, app_version)?;
+            .serialize(&mut writer, app_version)?;
         // Write the array.
         self.as_slice()
             .to_vec()
-            .serialize(&mut writer, version_map, app_version)?;
+            .serialize(&mut writer, app_version)?;
 
         Ok(())
     }
 
     #[inline]
-    fn deserialize<R: std::io::Read>(
-        reader: &mut R,
-        version_map: &VersionMap,
-        app_version: u16,
-    ) -> Result<Self> {
-        let header = T::deserialize(reader, version_map, app_version)
+    fn deserialize<R: std::io::Read>(reader: &mut R, app_version: u16) -> Result<Self> {
+        let header = T::deserialize(reader, app_version)
             .map_err(|ref err| Error::Deserialize(format!("{:?}", err)))?;
-        let entries: Vec<<T as FamStruct>::Entry> =
-            Vec::deserialize(reader, version_map, app_version)
-                .map_err(|ref err| Error::Deserialize(format!("{:?}", err)))?;
+        let entries: Vec<<T as FamStruct>::Entry> = Vec::deserialize(reader, app_version)
+            .map_err(|ref err| Error::Deserialize(format!("{:?}", err)))?;
         // Construct the object from the array items.
         // Header(T) fields will be initialized by Default trait impl.
         let mut object = FamStructWrapper::from_entries(&entries);
@@ -188,15 +160,14 @@ mod tests {
         ($ty:ident, $fn_name:ident) => {
             #[test]
             fn $fn_name() {
-                let vm = VersionMap::new();
                 let mut snapshot_mem = vec![0u8; 64];
 
                 let store: $ty = std::$ty::MAX;
                 store
-                    .serialize(&mut snapshot_mem.as_mut_slice(), &vm, 1)
+                    .serialize(&mut snapshot_mem.as_mut_slice(), 1)
                     .unwrap();
                 let restore =
-                    <$ty as Versionize>::deserialize(&mut snapshot_mem.as_slice(), &vm, 1).unwrap();
+                    <$ty as Versionize>::deserialize(&mut snapshot_mem.as_slice(), 1).unwrap();
 
                 assert_eq!(store, restore);
             }
@@ -219,37 +190,32 @@ mod tests {
 
     #[test]
     fn test_ser_de_bool() {
-        let vm = VersionMap::new();
         let mut snapshot_mem = vec![0u8; 64];
 
         let store = true;
         store
-            .serialize(&mut snapshot_mem.as_mut_slice(), &vm, 1)
+            .serialize(&mut snapshot_mem.as_mut_slice(), 1)
             .unwrap();
-        let restore =
-            <bool as Versionize>::deserialize(&mut snapshot_mem.as_slice(), &vm, 1).unwrap();
+        let restore = <bool as Versionize>::deserialize(&mut snapshot_mem.as_slice(), 1).unwrap();
 
         assert_eq!(store, restore);
     }
 
     #[test]
     fn test_ser_de_string() {
-        let vm = VersionMap::new();
         let mut snapshot_mem = vec![0u8; 64];
 
         let store = String::from("test string");
         store
-            .serialize(&mut snapshot_mem.as_mut_slice(), &vm, 1)
+            .serialize(&mut snapshot_mem.as_mut_slice(), 1)
             .unwrap();
-        let restore =
-            <String as Versionize>::deserialize(&mut snapshot_mem.as_slice(), &vm, 1).unwrap();
+        let restore = <String as Versionize>::deserialize(&mut snapshot_mem.as_slice(), 1).unwrap();
 
         assert_eq!(store, restore);
     }
 
     #[test]
     fn test_ser_de_vec() {
-        let vm = VersionMap::new();
         let mut snapshot_mem = vec![0u8; 64];
 
         let mut store = Vec::new();
@@ -258,10 +224,10 @@ mod tests {
         store.push("test 3".to_owned());
 
         store
-            .serialize(&mut snapshot_mem.as_mut_slice(), &vm, 1)
+            .serialize(&mut snapshot_mem.as_mut_slice(), 1)
             .unwrap();
         let restore =
-            <Vec<String> as Versionize>::deserialize(&mut snapshot_mem.as_slice(), &vm, 1).unwrap();
+            <Vec<String> as Versionize>::deserialize(&mut snapshot_mem.as_slice(), 1).unwrap();
 
         assert_eq!(store, restore);
     }
@@ -269,7 +235,6 @@ mod tests {
     #[test]
     fn test_ser_de_vec_version() {
         type MessageFamStructWrapper = FamStructWrapper<Message>;
-        let vm = VersionMap::new();
         let mut f = MessageFamStructWrapper::new(0);
         f.as_mut_fam_struct().padding = 123;
         f.as_mut_fam_struct().extra_value = 321;
@@ -283,11 +248,10 @@ mod tests {
         store.push(f.clone());
 
         store
-            .serialize(&mut snapshot_mem.as_mut_slice(), &vm, 1)
+            .serialize(&mut snapshot_mem.as_mut_slice(), 1)
             .unwrap();
         let restore = <Vec<MessageFamStructWrapper> as Versionize>::deserialize(
             &mut snapshot_mem.as_slice(),
-            &vm,
             1,
         )
         .unwrap();
@@ -338,21 +302,12 @@ mod tests {
 
     impl<T> Versionize for __IncompleteArrayField<T> {
         #[inline]
-        fn serialize<W: std::io::Write>(
-            &self,
-            _writer: &mut W,
-            _version_map: &VersionMap,
-            _app_version: u16,
-        ) -> Result<()> {
+        fn serialize<W: std::io::Write>(&self, _writer: &mut W, _app_version: u16) -> Result<()> {
             Ok(())
         }
 
         #[inline]
-        fn deserialize<R: std::io::Read>(
-            _reader: &mut R,
-            _version_map: &VersionMap,
-            _app_version: u16,
-        ) -> Result<Self> {
+        fn deserialize<R: std::io::Read>(_reader: &mut R, _app_version: u16) -> Result<Self> {
             Ok(Self::new())
         }
 

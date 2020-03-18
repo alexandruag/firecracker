@@ -52,7 +52,7 @@ pub fn impl_versionize(input: TokenStream) -> proc_macro::TokenStream {
     let deserializer = descriptor.generate_deserializer();
     let serializer = quote! {
         // Get the struct version for the input app_version.
-        let version = version_map.get_type_version(app_version, Self::type_id());
+        let version = crate::VERSION_MAP.get_type_version(app_version, Self::type_id());
         // We will use this copy to perform semantic serialization.
         let mut copy_of_self = self.clone();
         match version {
@@ -63,12 +63,12 @@ pub fn impl_versionize(input: TokenStream) -> proc_macro::TokenStream {
 
     (quote! {
         impl Versionize for #ident #generics {
-            fn serialize<W: std::io::Write>(&self, writer: &mut W, version_map: &VersionMap, app_version: u16) -> Result<()> {
+            fn serialize<W: std::io::Write>(&self, writer: &mut W, app_version: u16) -> Result<()> {
                 #serializer
                 Ok(())
             }
 
-            fn deserialize<R: std::io::Read>(mut reader: &mut R, version_map: &VersionMap, app_version: u16) -> Result<Self> {
+            fn deserialize<R: std::io::Read>(mut reader: &mut R, app_version: u16) -> Result<Self> {
                 #deserializer
             }
 
@@ -77,5 +77,6 @@ pub fn impl_versionize(input: TokenStream) -> proc_macro::TokenStream {
                 #version
             }
         }
-    }).into()
+    })
+    .into()
 }
