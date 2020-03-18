@@ -81,7 +81,20 @@ impl StructField {
             return proc_macro2::TokenStream::new();
         }
 
-        match &self.ty {
+        // For foreign types (i.e. types used from external crates, that have their own app
+        // version domain) we invoke serialize/deserialize using the version recorded in the
+        // version map instead of the local app version.
+        let mut token_stream = quote! {
+            let tid = std::any::TypeId::of::<Self>();
+
+            let app_version = if crate::FOREIGN_TYPES.contains(&tid) {
+                crate::VERSION_MAP.get_type_version(app_version, tid)
+            } else {
+                app_version
+            };
+        };
+
+        token_stream.extend(match &self.ty {
             syn::Type::Array(_) => quote! {
                 Versionize::serialize(&copy_of_self.#field_ident.to_vec(), writer, app_version)?;
             },
@@ -92,7 +105,9 @@ impl StructField {
                 Versionize::serialize(&copy_of_self.#field_ident, writer, app_version)?;
             },
             _ => panic!("Unsupported field type {:?}", self.ty),
-        }
+        });
+
+        token_stream
     }
 
     pub fn generate_deserializer(&self, source_version: u16) -> proc_macro2::TokenStream {
@@ -113,7 +128,6 @@ impl StructField {
         }
 
         let ty = &self.ty;
-
         match ty {
             syn::Type::Array(array) => {
                 let array_type_token;
@@ -143,7 +157,15 @@ impl StructField {
                 }
             }
             syn::Type::Path(_) => quote! {
-                #field_ident: <#ty as Versionize>::deserialize(&mut reader, app_version)?,
+                #field_ident: {
+                   let tid = std::any::TypeId::of::<#ty>();
+                        let app_version = if crate::FOREIGN_TYPES.contains(&tid) {
+                        crate::VERSION_MAP.get_type_version(app_version, tid)
+                    } else {
+                        app_version
+                    };
+                    <#ty as Versionize>::deserialize(&mut reader, app_version)?
+                },
             },
             syn::Type::Reference(_) => quote! {
                 #field_ident: <#ty as Versionize>::deserialize(&mut reader, app_version)?,

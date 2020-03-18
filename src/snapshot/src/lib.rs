@@ -48,7 +48,7 @@ pub mod version_map;
 use crc::{CRC64Reader, CRC64Writer};
 use snapshot_derive::Versionize;
 use std::any::TypeId;
-use std::collections::hash_map::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use version_map::VersionMap;
 
@@ -72,6 +72,7 @@ lazy_static! {
         #[cfg(not(test))]
         VersionMap::new()
     };
+    static ref FOREIGN_TYPES: HashSet<TypeId> = { HashSet::new() };
 }
 
 // 256k max section size.
