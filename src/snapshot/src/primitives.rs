@@ -139,7 +139,7 @@ mod tests {
 
     #[repr(C)]
     #[derive(Default, Debug, Versionize)]
-    struct Message {
+    pub(crate) struct Message {
         pub len: u32,
         pub padding: u32,
         pub value: u32,

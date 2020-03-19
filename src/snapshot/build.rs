@@ -1,11 +1,14 @@
-// Copyright 2020 Amazon.com, Inc. or its affiliates. All Rights Reserved.
-// SPDX-License-Identifier: Apache-2.0
-
-//! Maps struct/enum/union versions to a sequence of root versions.
-//! This is required to support the concept of a snapshot version
-//! composed of individually versioned components.
+use std::env;
+use std::fs;
+use std::path::Path;
 
 use std::collections::hash_map::HashMap;
+
+// !!!!!!!!!!!!!!!!!
+// !!!!!!!!!!!!!!!!!
+// !!!!!!!!!!!!!!!!!
+// !!!! TEMPORARY HACK BECAUSE I CAN'T FIGURE OUT HOW TO USE STUFF FROM
+// !!!! THE CURRENT CRATE IN THE BUILD.RS SCRIPT
 
 const BASE_VERSION: u16 = 1;
 
@@ -152,94 +155,34 @@ pub fn generate_type_version_fn(test_types: &[&str], m: &VersionMap) -> String {
     s
 }
 
-#[cfg(test)]
-mod test {
-    use super::{VersionMap, BASE_VERSION};
+fn main() {
+    // Here goes version map and type configuration.
 
-    pub struct MyType;
-    pub struct MySecondType;
-    pub struct MyThirdType;
+    let mut vm = VersionMap::new();
+    vm.new_version()
+        // .set_type_version("primitives::tests::Message", 1)
+        .set_type_version("tests::A", 2)
+        .set_type_version("tests::Test", 2)
+        .new_version()
+        .set_type_version("tests::A", 3)
+        .set_type_version("tests::Test", 3)
+        .new_version()
+        .set_type_version("tests::Test", 4);
 
-    #[test]
-    fn test_default_version() {
-        let vm = VersionMap::new();
-        assert_eq!(vm.latest_version(), 1);
-    }
+    let foreign_types = &[];
+    let test_types = &["tests::A", "tests::Test"];
 
-    #[test]
-    fn test_new_versions() {
-        let mut vm = VersionMap::new();
-        vm.new_version().new_version();
-        assert_eq!(vm.latest_version(), 3);
-    }
+    // End of configuration. Generate support code.
 
-    #[test]
-    fn test_1_app_version() {
-        let mut vm = VersionMap::new();
-        vm.set_type_version("MyType", 1);
-        vm.set_type_version("MySecondType", 2);
-        vm.set_type_version("MyThirdType", 3);
-
-        assert_eq!(vm.get_type_version(1, "MyType"), 1);
-        assert_eq!(vm.get_type_version(1, "MySecondType"), 2);
-        assert_eq!(vm.get_type_version(1, "MyThirdType"), 3);
-    }
-
-    #[test]
-    fn test_100_app_version_full() {
-        let mut vm = VersionMap::new();
-
-        for i in 1..=100 {
-            vm.set_type_version("MyType", i)
-                .set_type_version("MySecondType", i + 1)
-                .set_type_version("MyThirdType", i + 2)
-                .new_version();
-        }
-
-        for i in 1..=100 {
-            assert_eq!(vm.get_type_version(i, "MyType"), i);
-            assert_eq!(vm.get_type_version(i, "MySecondType"), i + 1);
-            assert_eq!(vm.get_type_version(i, "MyThirdType"), i + 2);
-        }
-    }
-
-    #[test]
-    fn test_app_versions_with_gap() {
-        let my_type_id = "MyType";
-        let my_second_type_id = "MySecondType";
-        let my_third_type_id = "MyThirdType";
-
-        let mut vm = VersionMap::new();
-        vm.set_type_version(my_type_id, 1);
-        vm.set_type_version(my_second_type_id, 1);
-        vm.set_type_version(my_third_type_id, 1);
-        vm.new_version();
-        vm.set_type_version(my_type_id, 2);
-        vm.new_version();
-        vm.set_type_version(my_third_type_id, 2);
-        vm.new_version();
-        vm.set_type_version(my_second_type_id, 2);
-
-        assert_eq!(vm.get_type_version(1, my_type_id), 1);
-        assert_eq!(vm.get_type_version(1, my_second_type_id), 1);
-        assert_eq!(vm.get_type_version(1, my_third_type_id), 1);
-
-        assert_eq!(vm.get_type_version(2, my_type_id), 2);
-        assert_eq!(vm.get_type_version(2, my_second_type_id), 1);
-        assert_eq!(vm.get_type_version(2, my_third_type_id), 1);
-
-        assert_eq!(vm.get_type_version(3, my_type_id), 2);
-        assert_eq!(vm.get_type_version(3, my_second_type_id), 1);
-        assert_eq!(vm.get_type_version(3, my_third_type_id), 2);
-
-        assert_eq!(vm.get_type_version(4, my_type_id), 2);
-        assert_eq!(vm.get_type_version(4, my_second_type_id), 2);
-        assert_eq!(vm.get_type_version(4, my_third_type_id), 2);
-    }
-
-    #[test]
-    fn test_unset_type() {
-        let vm = VersionMap::new();
-        assert_eq!(vm.get_type_version(1, "MyType"), BASE_VERSION);
-    }
+    let out_dir = env::var_os("OUT_DIR").unwrap();
+    let dest_path = Path::new(&out_dir).join("version_support.rs");
+    fs::write(
+        &dest_path,
+        format!(
+            "{}\n{}",
+            generate_type_version_fn(test_types, &vm),
+            generate_foreign_type_fn(test_types, foreign_types)
+        ),
+    )
+    .unwrap();
 }

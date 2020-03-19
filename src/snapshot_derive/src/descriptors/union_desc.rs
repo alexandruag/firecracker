@@ -41,7 +41,7 @@ impl Descriptor for UnionDescriptor {
         }
 
         quote! {
-            let version = crate::VERSION_MAP.get_type_version(app_version, Self::type_id());
+            let version = crate::type_version(Self::type_id(), app_version);
             match version {
                 #versioned_deserializers
                 _ => panic!("Unknown {:?} version {}.", Self::type_id(), version)

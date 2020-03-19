@@ -87,8 +87,8 @@ impl StructField {
         let mut token_stream = quote! {
             let tid = std::any::TypeId::of::<Self>();
 
-            let app_version = if crate::FOREIGN_TYPES.contains(&tid) {
-                crate::VERSION_MAP.get_type_version(app_version, tid)
+            let app_version = if crate::is_foreign_type(tid) {
+                crate::type_version(tid, app_version)
             } else {
                 app_version
             };
@@ -159,8 +159,8 @@ impl StructField {
             syn::Type::Path(_) => quote! {
                 #field_ident: {
                    let tid = std::any::TypeId::of::<#ty>();
-                        let app_version = if crate::FOREIGN_TYPES.contains(&tid) {
-                        crate::VERSION_MAP.get_type_version(app_version, tid)
+                   let app_version = if crate::is_foreign_type(tid) {
+                        crate::type_version(tid, app_version)
                     } else {
                         app_version
                     };

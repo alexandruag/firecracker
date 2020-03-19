@@ -48,32 +48,11 @@ pub mod version_map;
 use crc::{CRC64Reader, CRC64Writer};
 use snapshot_derive::Versionize;
 use std::any::TypeId;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use version_map::VersionMap;
 
-use lazy_static::lazy_static;
-
-lazy_static! {
-    static ref VERSION_MAP: VersionMap = {
-        #[cfg(test)]
-        {
-            let mut vm = VersionMap::new();
-            vm.new_version()
-                .set_type_version(TypeId::of::<tests::Test>(), 2)
-                .set_type_version(TypeId::of::<tests::A>(), 2)
-                .new_version()
-                .set_type_version(TypeId::of::<tests::Test>(), 3)
-                .set_type_version(TypeId::of::<tests::A>(), 3)
-                .new_version()
-                .set_type_version(TypeId::of::<tests::Test>(), 4);
-            vm
-        }
-        #[cfg(not(test))]
-        VersionMap::new()
-    };
-    static ref FOREIGN_TYPES: HashSet<TypeId> = { HashSet::new() };
-}
+include!(concat!(env!("OUT_DIR"), "/version_support.rs"));
 
 // 256k max section size.
 const SNAPSHOT_MAX_SECTION_SIZE: usize = 0x40000;
@@ -459,15 +438,43 @@ mod tests {
         }
     }
 
+    #[derive(Versionize, Debug, PartialEq, Clone)]
+    pub struct A {
+        #[version(start = 1, end = 2)]
+        x: u32,
+        y: String,
+        #[version(start = 2, default_fn = "default_A_z")]
+        z: String,
+        #[version(start = 3, ser_fn = "semantic_x")]
+        q: u64,
+    }
+
+    #[derive(Versionize, Debug, PartialEq, Clone)]
+    pub struct B {
+        a: A,
+        b: u64,
+    }
+
+    impl A {
+        fn default_A_z(_source_version: u16) -> String {
+            "whatever".to_owned()
+        }
+
+        fn semantic_x(&mut self, _target_version: u16) -> Result<()> {
+            self.x = self.q as u32;
+            Ok(())
+        }
+    }
+
     #[test]
     fn test_struct_semantic_fn() {
         let mut vm = VersionMap::new();
         vm.new_version()
-            .set_type_version(Test::type_id(), 2)
+            .set_type_version("Test", 2)
             .new_version()
-            .set_type_version(Test::type_id(), 3)
+            .set_type_version("Test", 3)
             .new_version()
-            .set_type_version(Test::type_id(), 4);
+            .set_type_version("Test", 4);
         let state = Test {
             field0: 0,
             field1: 1,
@@ -522,11 +529,11 @@ mod tests {
     fn test_semantic_serialize_error() {
         let mut vm = VersionMap::new();
         vm.new_version()
-            .set_type_version(Test::type_id(), 2)
+            .set_type_version("Test", 2)
             .new_version()
-            .set_type_version(Test::type_id(), 3)
+            .set_type_version("Test", 3)
             .new_version()
-            .set_type_version(Test::type_id(), 4);
+            .set_type_version("Test", 4);
 
         let state = Test {
             field0: 0,
@@ -553,11 +560,11 @@ mod tests {
     fn test_semantic_deserialize_error() {
         let mut vm = VersionMap::new();
         vm.new_version()
-            .set_type_version(Test::type_id(), 2)
+            .set_type_version("Test", 2)
             .new_version()
-            .set_type_version(Test::type_id(), 3)
+            .set_type_version("Test", 3)
             .new_version()
-            .set_type_version(Test::type_id(), 4);
+            .set_type_version("Test", 4);
 
         let state = Test {
             field0: 6666,
@@ -658,11 +665,11 @@ mod tests {
     fn test_deserialize_error() {
         let mut vm = VersionMap::new();
         vm.new_version()
-            .set_type_version(Test::type_id(), 2)
+            .set_type_version("Test", 2)
             .new_version()
-            .set_type_version(Test::type_id(), 3)
+            .set_type_version("Test", 3)
             .new_version()
-            .set_type_version(Test::type_id(), 4);
+            .set_type_version("Test", 4);
         let state = Test {
             field0: 0,
             field1: 1,
@@ -695,11 +702,11 @@ mod tests {
     fn test_struct_default_fn() {
         let mut vm = VersionMap::new();
         vm.new_version()
-            .set_type_version(Test::type_id(), 2)
+            .set_type_version("Test", 2)
             .new_version()
-            .set_type_version(Test::type_id(), 3)
+            .set_type_version("Test", 3)
             .new_version()
-            .set_type_version(Test::type_id(), 4);
+            .set_type_version("Test", 4);
         let state = Test {
             field0: 0,
             field1: 1,
@@ -836,41 +843,13 @@ mod tests {
         assert_eq!(restored_state, state);
     }
 
-    #[derive(Versionize, Debug, PartialEq, Clone)]
-    pub struct A {
-        #[version(start = 1, end = 2)]
-        x: u32,
-        y: String,
-        #[version(start = 2, default_fn = "default_A_z")]
-        z: String,
-        #[version(start = 3, ser_fn = "semantic_x")]
-        q: u64,
-    }
-
-    #[derive(Versionize, Debug, PartialEq, Clone)]
-    pub struct B {
-        a: A,
-        b: u64,
-    }
-
-    impl A {
-        fn default_A_z(_source_version: u16) -> String {
-            "whatever".to_owned()
-        }
-
-        fn semantic_x(&mut self, _target_version: u16) -> Result<()> {
-            self.x = self.q as u32;
-            Ok(())
-        }
-    }
-
     #[test]
     fn test_basic_add_remove_field() {
         let mut vm = VersionMap::new();
         vm.new_version()
-            .set_type_version(A::type_id(), 2)
+            .set_type_version("A", 2)
             .new_version()
-            .set_type_version(A::type_id(), 3);
+            .set_type_version("A", 3);
 
         // The blobs have been serialized from this state:
         // let state = B {
