@@ -14,9 +14,8 @@ use std::{
 use arch::aarch64::gic::GICDevice;
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::{
-    kvm_clock_data, kvm_irqchip, kvm_pit_config, kvm_pit_state2, CpuId, MsrList,
-    KVM_CLOCK_TSC_STABLE, KVM_IRQCHIP_IOAPIC, KVM_IRQCHIP_PIC_MASTER, KVM_IRQCHIP_PIC_SLAVE,
-    KVM_MAX_CPUID_ENTRIES, KVM_PIT_SPEAKER_DUMMY,
+    kvm_irqchip, kvm_pit_config, CpuId, MsrList, KVM_CLOCK_TSC_STABLE, KVM_IRQCHIP_IOAPIC,
+    KVM_IRQCHIP_PIC_MASTER, KVM_IRQCHIP_PIC_SLAVE, KVM_MAX_CPUID_ENTRIES, KVM_PIT_SPEAKER_DUMMY,
 };
 use kvm_bindings::{kvm_userspace_memory_region, KVM_MEM_LOG_DIRTY_PAGES};
 use kvm_ioctls::{Kvm, VmFd};
@@ -232,11 +231,11 @@ impl Vm {
             .map_err(Error::VmGetIrqChip)?;
 
         Ok(VmState {
-            pitstate,
-            clock,
-            pic_master,
-            pic_slave,
-            ioapic,
+            pitstate: pitstate.into(),
+            clock: clock.into(),
+            pic_master: pic_master.into(),
+            pic_slave: pic_slave.into(),
+            ioapic: ioapic.into(),
         })
     }
 
@@ -244,17 +243,19 @@ impl Vm {
     /// Restores the Kvm Vm state.
     pub fn restore_state(&self, state: &VmState) -> Result<()> {
         self.fd
-            .set_pit2(&state.pitstate)
+            .set_pit2(&state.pitstate.into())
             .map_err(Error::VmSetPit2)?;
-        self.fd.set_clock(&state.clock).map_err(Error::VmSetClock)?;
         self.fd
-            .set_irqchip(&state.pic_master)
+            .set_clock(&state.clock.into())
+            .map_err(Error::VmSetClock)?;
+        self.fd
+            .set_irqchip(&state.pic_master.into())
             .map_err(Error::VmSetIrqChip)?;
         self.fd
-            .set_irqchip(&state.pic_slave)
+            .set_irqchip(&state.pic_slave.into())
             .map_err(Error::VmSetIrqChip)?;
         self.fd
-            .set_irqchip(&state.ioapic)
+            .set_irqchip(&state.ioapic.into())
             .map_err(Error::VmSetIrqChip)?;
         Ok(())
     }
@@ -291,11 +292,11 @@ impl Vm {
 #[derive(Versionize)]
 /// Structure holding VM kvm state.
 pub struct VmState {
-    pitstate: kvm_pit_state2,
-    clock: kvm_clock_data,
-    pic_master: kvm_irqchip,
-    pic_slave: kvm_irqchip,
-    ioapic: kvm_irqchip,
+    pitstate: kvm_bindings_versionize::kvm_pit_state2,
+    clock: kvm_bindings_versionize::kvm_clock_data,
+    pic_master: kvm_bindings_versionize::kvm_irqchip,
+    pic_slave: kvm_bindings_versionize::kvm_irqchip,
+    ioapic: kvm_bindings_versionize::kvm_irqchip,
 }
 
 #[cfg(test)]

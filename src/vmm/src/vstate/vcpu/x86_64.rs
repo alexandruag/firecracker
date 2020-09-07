@@ -16,10 +16,8 @@ use crate::vstate::{
     vm::Vm,
 };
 use cpuid::{c3, filter_cpuid, t2, VmSpec};
-use kvm_bindings::{
-    kvm_debugregs, kvm_lapic_state, kvm_mp_state, kvm_regs, kvm_sregs, kvm_vcpu_events, kvm_xcrs,
-    kvm_xsave, CpuId, MsrList, Msrs,
-};
+use kvm_bindings::{CpuId, MsrList, Msrs};
+use kvm_bindings_versionize::{self, convert_fam_struct_wrapper};
 use kvm_ioctls::{VcpuExit, VcpuFd};
 use logger::{error, Metric, METRICS};
 use versionize::{VersionMap, Versionize, VersionizeResult};
@@ -274,20 +272,22 @@ impl KvmVcpu {
             .get_vcpu_events()
             .map_err(Error::VcpuGetVcpuEvents)?;
 
+        let cpuid = self
+            .fd
+            .get_cpuid2(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
+            .map_err(Error::VcpuGetCpuid)?;
+
         Ok(VcpuState {
-            cpuid: self
-                .fd
-                .get_cpuid2(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
-                .map_err(Error::VcpuGetCpuid)?,
-            msrs,
-            debug_regs,
-            lapic,
-            mp_state,
-            regs,
-            sregs,
-            vcpu_events,
-            xcrs,
-            xsave,
+            cpuid: convert_fam_struct_wrapper(&cpuid),
+            msrs: convert_fam_struct_wrapper(&msrs),
+            debug_regs: debug_regs.into(),
+            lapic: lapic.into(),
+            mp_state: mp_state.into(),
+            regs: regs.into(),
+            sregs: sregs.into(),
+            vcpu_events: vcpu_events.into(),
+            xcrs: xcrs.into(),
+            xsave: xsave.into(),
         })
     }
 
@@ -315,29 +315,35 @@ impl KvmVcpu {
          * SET_LAPIC must come before SET_MSRS, because the TSC deadline MSR
          * only restores successfully, when the LAPIC is correctly configured.
          */
+        let cpuid = convert_fam_struct_wrapper(&state.cpuid);
+        self.fd.set_cpuid2(&cpuid).map_err(Error::VcpuSetCpuid)?;
         self.fd
-            .set_cpuid2(&state.cpuid)
-            .map_err(Error::VcpuSetCpuid)?;
-        self.fd
-            .set_mp_state(state.mp_state)
+            .set_mp_state(state.mp_state.into())
             .map_err(Error::VcpuSetMpState)?;
-        self.fd.set_regs(&state.regs).map_err(Error::VcpuSetRegs)?;
         self.fd
-            .set_sregs(&state.sregs)
+            .set_regs(&state.regs.into())
+            .map_err(Error::VcpuSetRegs)?;
+        self.fd
+            .set_sregs(&state.sregs.into())
             .map_err(Error::VcpuSetSregs)?;
         self.fd
-            .set_xsave(&state.xsave)
+            .set_xsave(&state.xsave.into())
             .map_err(Error::VcpuSetXsave)?;
-        self.fd.set_xcrs(&state.xcrs).map_err(Error::VcpuSetXcrs)?;
         self.fd
-            .set_debug_regs(&state.debug_regs)
+            .set_xcrs(&state.xcrs.into())
+            .map_err(Error::VcpuSetXcrs)?;
+        self.fd
+            .set_debug_regs(&state.debug_regs.into())
             .map_err(Error::VcpuSetDebugRegs)?;
         self.fd
-            .set_lapic(&state.lapic)
+            .set_lapic(&state.lapic.into())
             .map_err(Error::VcpuSetLapic)?;
-        self.fd.set_msrs(&state.msrs).map_err(Error::VcpuSetMsrs)?;
+
+        let msrs = convert_fam_struct_wrapper(&state.msrs);
+        self.fd.set_msrs(&msrs).map_err(Error::VcpuSetMsrs)?;
+
         self.fd
-            .set_vcpu_events(&state.vcpu_events)
+            .set_vcpu_events(&state.vcpu_events.into())
             .map_err(Error::VcpuSetVcpuEvents)?;
         Ok(())
     }
@@ -378,16 +384,16 @@ impl KvmVcpu {
 #[derive(Clone, Versionize)]
 /// Structure holding VCPU kvm state.
 pub struct VcpuState {
-    cpuid: CpuId,
-    msrs: Msrs,
-    debug_regs: kvm_debugregs,
-    lapic: kvm_lapic_state,
-    mp_state: kvm_mp_state,
-    regs: kvm_regs,
-    sregs: kvm_sregs,
-    vcpu_events: kvm_vcpu_events,
-    xcrs: kvm_xcrs,
-    xsave: kvm_xsave,
+    cpuid: kvm_bindings_versionize::CpuId,
+    msrs: kvm_bindings_versionize::Msrs,
+    debug_regs: kvm_bindings_versionize::kvm_debugregs,
+    lapic: kvm_bindings_versionize::kvm_lapic_state,
+    mp_state: kvm_bindings_versionize::kvm_mp_state,
+    regs: kvm_bindings_versionize::kvm_regs,
+    sregs: kvm_bindings_versionize::kvm_sregs,
+    vcpu_events: kvm_bindings_versionize::kvm_vcpu_events,
+    xcrs: kvm_bindings_versionize::kvm_xcrs,
+    xsave: kvm_bindings_versionize::kvm_xsave,
 }
 
 #[cfg(test)]
@@ -400,8 +406,8 @@ mod tests {
     impl Default for VcpuState {
         fn default() -> Self {
             VcpuState {
-                cpuid: CpuId::new(1),
-                msrs: Msrs::new(1),
+                cpuid: kvm_bindings_versionize::CpuId::new(1),
+                msrs: kvm_bindings_versionize::Msrs::new(1),
                 debug_regs: Default::default(),
                 lapic: Default::default(),
                 mp_state: Default::default(),
