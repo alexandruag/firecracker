@@ -23,10 +23,10 @@ use vm_memory::guest_memory::{
     self, FileOffset, GuestAddress, GuestMemory, GuestMemoryRegion, GuestUsize, MemoryRegionAddress,
 };
 use vm_memory::volatile_memory::{VolatileMemory, VolatileSlice};
-use vm_memory::Bytes;
+use vm_memory::{ByteValued, Bytes};
 
 #[cfg(unix)]
-pub use vm_memory::mmap::{MmapRegionError, MmapRegion};
+pub use vm_memory::mmap::{MmapRegion, MmapRegionError};
 
 // Here are some things that originate in this module, and we can continue to use the upstream
 // definitions/implementations.
@@ -59,6 +59,13 @@ impl GuestRegionMmap {
             guest_base,
         })
     }
+
+    // This is exclusively used for the local `Bytes` implementation.
+    fn local_volatile_slice(&self) -> VolatileSlice {
+        // It's safe to unwrap because we're starting at offset 0 and specify the exact
+        // length of the mapping.
+        self.mapping.get_slice(0, self.mapping.len()).unwrap()
+    }
 }
 
 impl Deref for GuestRegionMmap {
@@ -83,9 +90,9 @@ impl Bytes<MemoryRegionAddress> for GuestRegionMmap {
     ///   assert_eq!(5, res);
     /// ```
     fn write(&self, buf: &[u8], addr: MemoryRegionAddress) -> guest_memory::Result<usize> {
+        // TODO: here be write!
         let maddr = addr.raw_value() as usize;
-        self.as_volatile_slice()
-            .unwrap()
+        self.local_volatile_slice()
             .write(buf, maddr)
             .map_err(Into::into)
     }
@@ -102,27 +109,44 @@ impl Bytes<MemoryRegionAddress> for GuestRegionMmap {
     ///   assert_eq!(16, res);
     /// ```
     fn read(&self, buf: &mut [u8], addr: MemoryRegionAddress) -> guest_memory::Result<usize> {
+        // TODO: here be read!
         let maddr = addr.raw_value() as usize;
-        self.as_volatile_slice()
-            .unwrap()
+        self.local_volatile_slice()
             .read(buf, maddr)
             .map_err(Into::into)
     }
 
     fn write_slice(&self, buf: &[u8], addr: MemoryRegionAddress) -> guest_memory::Result<()> {
+        // TODO: here be write!
         let maddr = addr.raw_value() as usize;
-        self.as_volatile_slice()
-            .unwrap()
+        self.local_volatile_slice()
             .write_slice(buf, maddr)
             .map_err(Into::into)
     }
 
     fn read_slice(&self, buf: &mut [u8], addr: MemoryRegionAddress) -> guest_memory::Result<()> {
+        // TODO: here be read!
         let maddr = addr.raw_value() as usize;
-        self.as_volatile_slice()
-            .unwrap()
+        self.local_volatile_slice()
             .read_slice(buf, maddr)
             .map_err(Into::into)
+    }
+
+    // Add explicit implementations for the `*_obj` methods, just in case something changes
+    // with the default logic provided in `Bytes`.
+    fn write_obj<T: ByteValued>(
+        &self,
+        val: T,
+        addr: MemoryRegionAddress,
+    ) -> guest_memory::Result<()> {
+        // Write dispatched to write_slice.
+        self.write_slice(val.as_slice(), addr)
+    }
+
+    fn read_obj<T: ByteValued>(&self, addr: MemoryRegionAddress) -> guest_memory::Result<T> {
+        let mut result: T = Default::default();
+        // Read dispatched to `read_slice`.
+        self.read_slice(result.as_mut_slice(), addr).map(|_| result)
     }
 
     /// # Examples
@@ -151,12 +175,12 @@ impl Bytes<MemoryRegionAddress> for GuestRegionMmap {
         src: &mut F,
         count: usize,
     ) -> guest_memory::Result<usize>
-        where
-            F: Read,
+    where
+        F: Read,
     {
+        // TODO: here be write!
         let maddr = addr.raw_value() as usize;
-        self.as_volatile_slice()
-            .unwrap()
+        self.local_volatile_slice()
             .read_from::<F>(maddr, src, count)
             .map_err(Into::into)
     }
@@ -187,12 +211,12 @@ impl Bytes<MemoryRegionAddress> for GuestRegionMmap {
         src: &mut F,
         count: usize,
     ) -> guest_memory::Result<()>
-        where
-            F: Read,
+    where
+        F: Read,
     {
+        // TODO: here be write!
         let maddr = addr.raw_value() as usize;
-        self.as_volatile_slice()
-            .unwrap()
+        self.local_volatile_slice()
             .read_exact_from::<F>(maddr, src, count)
             .map_err(Into::into)
     }
@@ -220,12 +244,12 @@ impl Bytes<MemoryRegionAddress> for GuestRegionMmap {
         dst: &mut F,
         count: usize,
     ) -> guest_memory::Result<usize>
-        where
-            F: Write,
+    where
+        F: Write,
     {
+        // TODO: here be read!
         let maddr = addr.raw_value() as usize;
-        self.as_volatile_slice()
-            .unwrap()
+        self.local_volatile_slice()
             .write_to::<F>(maddr, dst, count)
             .map_err(Into::into)
     }
@@ -253,12 +277,12 @@ impl Bytes<MemoryRegionAddress> for GuestRegionMmap {
         dst: &mut F,
         count: usize,
     ) -> guest_memory::Result<()>
-        where
-            F: Write,
+    where
+        F: Write,
     {
+        // TODO: here be read!
         let maddr = addr.raw_value() as usize;
-        self.as_volatile_slice()
-            .unwrap()
+        self.local_volatile_slice()
             .write_all_to::<F>(maddr, dst, count)
             .map_err(Into::into)
     }
@@ -297,11 +321,19 @@ impl GuestMemoryRegion for GuestRegionMmap {
 
     fn get_slice(
         &self,
-        offset: MemoryRegionAddress,
-        count: usize,
+        _offset: MemoryRegionAddress,
+        _count: usize,
     ) -> guest_memory::Result<VolatileSlice> {
-        let slice = self.mapping.get_slice(offset.raw_value() as usize, count)?;
-        Ok(slice)
+        // We are not making use of `VolatileSlice`s outside of the local `Bytes` implementation
+        // for `GuestMemoryMmap` until the `vm-memory` interface stabilizes. This method is part
+        // of the current public `vm-memory` interface, and has to be implemented, so we just
+        // return an error.
+        Err(guest_memory::Error::HostAddressNotAvailable)
+    }
+
+    fn as_volatile_slice(&self) -> guest_memory::Result<VolatileSlice> {
+        // Return an error here for the same reasons as above.
+        Err(guest_memory::Error::HostAddressNotAvailable)
     }
 }
 
@@ -334,9 +366,9 @@ impl GuestMemoryMmap {
     /// Valid memory regions are specified as a sequence of (Address, Size, Option<FileOffset>)
     /// tuples sorted by Address.
     pub fn from_ranges_with_files<A, T>(ranges: T) -> result::Result<Self, Error>
-        where
-            A: Borrow<(GuestAddress, usize, Option<FileOffset>)>,
-            T: IntoIterator<Item = A>,
+    where
+        A: Borrow<(GuestAddress, usize, Option<FileOffset>)>,
+        T: IntoIterator<Item = A>,
     {
         Self::from_regions(
             ranges
@@ -350,8 +382,8 @@ impl GuestMemoryMmap {
                     } else {
                         MmapRegion::new(size)
                     }
-                        .map_err(Error::MmapRegion)
-                        .and_then(|r| GuestRegionMmap::new(r, guest_base))
+                    .map_err(Error::MmapRegion)
+                    .and_then(|r| GuestRegionMmap::new(r, guest_base))
                 })
                 .collect::<result::Result<Vec<_>, Error>>()?,
         )
@@ -457,8 +489,8 @@ impl GuestMemory for GuestMemoryMmap {
     }
 
     fn with_regions<F, E>(&self, cb: F) -> result::Result<(), E>
-        where
-            F: Fn(usize, &Self::R) -> result::Result<(), E>,
+    where
+        F: Fn(usize, &Self::R) -> result::Result<(), E>,
     {
         for (index, region) in self.regions.iter().enumerate() {
             cb(index, region)?;
@@ -467,8 +499,8 @@ impl GuestMemory for GuestMemoryMmap {
     }
 
     fn with_regions_mut<F, E>(&self, mut cb: F) -> result::Result<(), E>
-        where
-            F: FnMut(usize, &Self::R) -> result::Result<(), E>,
+    where
+        F: FnMut(usize, &Self::R) -> result::Result<(), E>,
     {
         for (index, region) in self.regions.iter().enumerate() {
             cb(index, region)?;
@@ -477,9 +509,9 @@ impl GuestMemory for GuestMemoryMmap {
     }
 
     fn map_and_fold<F, G, T>(&self, init: T, mapf: F, foldf: G) -> T
-        where
-            F: Fn((usize, &Self::R)) -> T,
-            G: Fn(T, T) -> T,
+    where
+        F: Fn((usize, &Self::R)) -> T,
+        G: Fn(T, T) -> T,
     {
         self.regions
             .iter()
@@ -788,7 +820,7 @@ mod tests {
             (start_addr1, 0x400, Some(FileOffset::new(f1, 0))),
             (start_addr2, 0x400, Some(FileOffset::new(f2, 0))),
         ])
-            .unwrap();
+        .unwrap();
 
         let guest_mem_list = vec![guest_mem, guest_mem_backed_by_file];
         for guest_mem in guest_mem_list.iter() {
@@ -814,7 +846,7 @@ mod tests {
             (start_addr1, 0x400, Some(FileOffset::new(f1, 0))),
             (start_addr2, 0x400, Some(FileOffset::new(f2, 0))),
         ])
-            .unwrap();
+        .unwrap();
 
         let guest_mem_list = vec![guest_mem, guest_mem_backed_by_file];
         for guest_mem in guest_mem_list.iter() {
@@ -846,7 +878,7 @@ mod tests {
             (start_addr1, 0x400, Some(FileOffset::new(f1, 0))),
             (start_addr2, 0x400, Some(FileOffset::new(f2, 0))),
         ])
-            .unwrap();
+        .unwrap();
 
         let guest_mem_list = vec![guest_mem, guest_mem_backed_by_file];
         for guest_mem in guest_mem_list.iter() {
@@ -874,7 +906,7 @@ mod tests {
             (start_addr1, 0x400, Some(FileOffset::new(f1, 0))),
             (start_addr2, 0x400, Some(FileOffset::new(f2, 0))),
         ])
-            .unwrap();
+        .unwrap();
 
         let guest_mem_list = vec![guest_mem, guest_mem_backed_by_file];
         for guest_mem in guest_mem_list.iter() {
@@ -901,7 +933,7 @@ mod tests {
             0x400,
             Some(FileOffset::new(f, 0)),
         )])
-            .unwrap();
+        .unwrap();
 
         let guest_mem_list = vec![guest_mem, guest_mem_backed_by_file];
         for guest_mem in guest_mem_list.iter() {
@@ -911,8 +943,7 @@ mod tests {
             let slice = guest_mem
                 .find_region(GuestAddress(0))
                 .unwrap()
-                .as_volatile_slice()
-                .unwrap();
+                .local_volatile_slice();
 
             let buf = &mut [0, 0, 0, 0, 0];
             assert_eq!(slice.read(buf, 0).unwrap(), 5);
@@ -939,7 +970,7 @@ mod tests {
             (start_addr1, 0x1000, Some(FileOffset::new(f1, 0))),
             (start_addr2, 0x1000, Some(FileOffset::new(f2, 0))),
         ])
-            .unwrap();
+        .unwrap();
 
         let gm_list = vec![gm, gm_backed_by_file];
         for gm in gm_list.iter() {
@@ -979,7 +1010,7 @@ mod tests {
             0x400,
             Some(FileOffset::new(f, 0)),
         )])
-            .unwrap();
+        .unwrap();
 
         let gm_list = vec![gm, gm_backed_by_file];
         for gm in gm_list.iter() {
@@ -1010,7 +1041,7 @@ mod tests {
             0x400,
             Some(FileOffset::new(f, 0)),
         )])
-            .unwrap();
+        .unwrap();
 
         let gm_list = vec![gm, gm_backed_by_file];
         for gm in gm_list.iter() {
@@ -1118,7 +1149,7 @@ mod tests {
             (start_addr1, 0x1000, Some(FileOffset::new(f1, 0))),
             (start_addr2, 0x1000, Some(FileOffset::new(f2, 0))),
         ])
-            .unwrap();
+        .unwrap();
 
         let gm_list = vec![gm, gm_backed_by_file];
         for gm in gm_list.iter() {
@@ -1146,7 +1177,7 @@ mod tests {
             0x400,
             Some(FileOffset::new(f, 0)),
         )])
-            .unwrap();
+        .unwrap();
         assert!(gm.find_region(start_addr).is_some());
         let region = gm.find_region(start_addr).unwrap();
         assert!(region.file_offset().is_some());
@@ -1175,7 +1206,7 @@ mod tests {
             0x400,
             Some(FileOffset::new(f, offset)),
         )])
-            .unwrap();
+        .unwrap();
         assert!(gm.find_region(start_addr).is_some());
         let region = gm.find_region(start_addr).unwrap();
         assert!(region.file_offset().is_some());
@@ -1243,77 +1274,15 @@ mod tests {
     }
 
     #[test]
-    fn test_guest_memory_mmap_get_slice() {
-        let region_addr = GuestAddress(0);
-        let region_size = 0x400;
-        let region =
-            GuestRegionMmap::new(MmapRegion::new(region_size).unwrap(), region_addr).unwrap();
+    fn test_volatile_slice_is_err() {
+        // Verify that we are returning errors when `VolatileSlice`s are requested through the
+        // public interface methods for now.
 
-        // Normal case.
-        let slice_addr = MemoryRegionAddress(0x100);
-        let slice_size = 0x200;
-        let slice = region.get_slice(slice_addr, slice_size).unwrap();
-        assert_eq!(slice.len(), slice_size);
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
+        assert!(mem.get_slice(GuestAddress(0), 1).is_err());
 
-        // Empty slice.
-        let slice_addr = MemoryRegionAddress(0x200);
-        let slice_size = 0x0;
-        let slice = region.get_slice(slice_addr, slice_size).unwrap();
-        assert!(slice.is_empty());
-
-        // Error case when slice_size is beyond the boundary.
-        let slice_addr = MemoryRegionAddress(0x300);
-        let slice_size = 0x200;
-        assert!(region.get_slice(slice_addr, slice_size).is_err());
-    }
-
-    #[test]
-    fn test_guest_memory_mmap_as_volatile_slice() {
-        let region_addr = GuestAddress(0);
-        let region_size = 0x400;
-        let region =
-            GuestRegionMmap::new(MmapRegion::new(region_size).unwrap(), region_addr).unwrap();
-
-        // Test slice length.
-        let slice = region.as_volatile_slice().unwrap();
-        assert_eq!(slice.len(), region_size);
-
-        // Test slice data.
-        let v = 0x1234_5678u32;
-        let r = slice.get_ref::<u32>(0x200).unwrap();
-        r.store(v);
-        assert_eq!(r.load(), v);
-    }
-
-    #[test]
-    fn test_guest_memory_get_slice() {
-        let start_addr1 = GuestAddress(0);
-        let start_addr2 = GuestAddress(0x800);
-        let guest_mem =
-            GuestMemoryMmap::from_ranges(&[(start_addr1, 0x400), (start_addr2, 0x400)]).unwrap();
-
-        // Normal cases.
-        let slice_size = 0x200;
-        let slice = guest_mem
-            .get_slice(GuestAddress(0x100), slice_size)
-            .unwrap();
-        assert_eq!(slice.len(), slice_size);
-
-        let slice_size = 0x400;
-        let slice = guest_mem
-            .get_slice(GuestAddress(0x800), slice_size)
-            .unwrap();
-        assert_eq!(slice.len(), slice_size);
-
-        // Empty slice.
-        assert!(guest_mem
-            .get_slice(GuestAddress(0x900), 0)
-            .unwrap()
-            .is_empty());
-
-        // Error cases, wrong size or base address.
-        assert!(guest_mem.get_slice(GuestAddress(0), 0x500).is_err());
-        assert!(guest_mem.get_slice(GuestAddress(0x600), 0x100).is_err());
-        assert!(guest_mem.get_slice(GuestAddress(0xc00), 0x100).is_err());
+        let region = mem.find_region(GuestAddress(0)).unwrap();
+        assert!(region.get_slice(MemoryRegionAddress(0), 1).is_err());
+        assert!(region.as_volatile_slice().is_err());
     }
 }
