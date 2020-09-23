@@ -249,6 +249,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "mmap_fork"
+version = "0.1.0"
+dependencies = [
+ "vm-memory 0.2.2 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[[package]]
 name = "mmds"
 version = "0.1.0"
 dependencies = [
@@ -475,6 +482,7 @@ dependencies = [
  "lazy_static 1.4.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "libc 0.2.68 (registry+https://github.com/rust-lang/crates.io-index)",
  "logger 0.1.0",
+ "mmap_fork 0.1.0",
  "mmds 0.1.0",
  "polly 0.0.1",
  "rate_limiter 0.1.0",
