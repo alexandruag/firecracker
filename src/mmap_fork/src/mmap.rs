@@ -13,109 +13,29 @@
 //! This implementation is mmap-ing the memory of the guest into the current process.
 
 use std::borrow::Borrow;
-use std::error;
-use std::fmt;
 use std::io::{Read, Write};
 use std::ops::Deref;
 use std::result;
 use std::sync::Arc;
 
-use crate::address::Address;
-use crate::guest_memory::{
+use vm_memory::address::Address;
+use vm_memory::guest_memory::{
     self, FileOffset, GuestAddress, GuestMemory, GuestMemoryRegion, GuestUsize, MemoryRegionAddress,
 };
-use crate::volatile_memory::{VolatileMemory, VolatileSlice};
-use crate::Bytes;
+use vm_memory::volatile_memory::{VolatileMemory, VolatileSlice};
+use vm_memory::Bytes;
 
 #[cfg(unix)]
-pub use crate::mmap_unix::{Error as MmapRegionError, MmapRegion};
+pub use vm_memory::mmap::{MmapRegionError, MmapRegion};
+
+// Here are some things that originate in this module, and we can continue to use the upstream
+// definitions/implementations.
+pub use vm_memory::mmap::{check_file_offset, Error};
 
 #[cfg(windows)]
 pub use crate::mmap_windows::MmapRegion;
 #[cfg(windows)]
 pub use std::io::Error as MmapRegionError;
-
-/// Trait implemented by the underlying `MmapRegion`.
-pub(crate) trait AsSlice {
-    /// Returns a slice corresponding to the data in the underlying `MmapRegion`.
-    ///
-    /// # Safety
-    ///
-    /// This is unsafe because of possible aliasing.
-    unsafe fn as_slice(&self) -> &[u8];
-
-    /// Returns a mutable slice corresponding to the data in the underlying `MmapRegion`.
-    ///
-    /// # Safety
-    ///
-    /// This is unsafe because of possible aliasing.
-    #[allow(clippy::mut_from_ref)]
-    unsafe fn as_mut_slice(&self) -> &mut [u8];
-}
-
-/// Errors that can occur when creating a memory map.
-#[derive(Debug)]
-pub enum Error {
-    /// Adding the guest base address to the length of the underlying mapping resulted
-    /// in an overflow.
-    InvalidGuestRegion,
-    /// Error creating a `MmapRegion` object.
-    MmapRegion(MmapRegionError),
-    /// No memory region found.
-    NoMemoryRegion,
-    /// Some of the memory regions intersect with each other.
-    MemoryRegionOverlap,
-    /// The provided memory regions haven't been sorted.
-    UnsortedMemoryRegions,
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Error::InvalidGuestRegion => write!(
-                f,
-                "Adding the guest base address to the length of the underlying mapping \
-                 resulted in an overflow"
-            ),
-            Error::MmapRegion(e) => write!(f, "{}", e),
-            Error::NoMemoryRegion => write!(f, "No memory region found"),
-            Error::MemoryRegionOverlap => {
-                write!(f, "Some of the memory regions intersect with each other")
-            }
-            Error::UnsortedMemoryRegions => {
-                write!(f, "The provided memory regions haven't been sorted")
-            }
-        }
-    }
-}
-
-impl error::Error for Error {}
-
-// TODO: use this for Windows as well after we redefine the Error type there.
-#[cfg(unix)]
-/// Checks if a mapping of `size` bytes fits at the provided `file_offset`.
-///
-/// For a borrowed `FileOffset` and size, this function checks whether the mapping does not
-/// extend past EOF, and that adding the size to the file offset does not lead to overflow.
-pub fn check_file_offset(
-    file_offset: &FileOffset,
-    size: usize,
-) -> result::Result<(), MmapRegionError> {
-    let file = file_offset.file();
-    let start = file_offset.start();
-
-    if let Some(end) = start.checked_add(size as u64) {
-        if let Ok(metadata) = file.metadata() {
-            if metadata.len() < end {
-                return Err(MmapRegionError::MappingPastEof);
-            }
-        }
-    } else {
-        return Err(MmapRegionError::InvalidOffsetLength);
-    }
-
-    Ok(())
-}
 
 /// [`GuestMemoryRegion`](trait.GuestMemoryRegion.html) implementation that mmaps the guest's
 /// memory region in the current process.
@@ -358,11 +278,13 @@ impl GuestMemoryRegion for GuestRegionMmap {
     }
 
     unsafe fn as_slice(&self) -> Option<&[u8]> {
-        Some(self.mapping.as_slice())
+        // We don't use this functionality.
+        None
     }
 
     unsafe fn as_mut_slice(&self) -> Option<&mut [u8]> {
-        Some(self.mapping.as_mut_slice())
+        // We don't use this functionality.
+        None
     }
 
     fn get_host_address(&self, addr: MemoryRegionAddress) -> guest_memory::Result<*mut u8> {
@@ -572,7 +494,7 @@ mod tests {
     extern crate vmm_sys_util;
 
     use super::*;
-    use crate::GuestAddressSpace;
+    use vm_memory::GuestAddressSpace;
 
     use std::fs::File;
     use std::mem;

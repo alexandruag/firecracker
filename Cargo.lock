@@ -253,6 +253,7 @@ name = "mmap_fork"
 version = "0.1.0"
 dependencies = [
  "vm-memory 0.2.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "vmm-sys-util 0.6.1 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
