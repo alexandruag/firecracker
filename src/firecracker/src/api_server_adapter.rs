@@ -19,7 +19,7 @@ use utils::{
     eventfd::EventFd,
 };
 use vmm::{
-    rpc_interface::{PrebootApiController, RuntimeApiController},
+    rpc_interface::{PrebootApiController, RuntimeApiController, VmmAction},
     vmm_config::instance_info::InstanceInfo,
     vmm_config::machine_config::VmConfig,
     Vmm,
@@ -58,6 +58,15 @@ impl ApiServerAdapter {
                 .expect("EventManager events driver fatal error");
         }
     }
+
+    fn handle_request(&mut self, req_action: VmmAction) {
+        let response = self.controller.handle_request(req_action);
+        // Send back the result.
+        self.to_api
+            .send(Box::new(response))
+            .map_err(|_| ())
+            .expect("one-shot channel closed");
+    }
 }
 impl Subscriber for ApiServerAdapter {
     /// Handle a read event (EPOLLIN).
@@ -66,14 +75,37 @@ impl Subscriber for ApiServerAdapter {
         let event_set = event.event_set();
 
         if source == self.api_event_fd.as_raw_fd() && event_set == EventSet::IN {
+            // Moving this at the beginning, because there seems to be a race window if we reset
+            // the count after processing requests. Actually, can we have multiple pending reqs,
+            // or the API server itself ensures we each one is fully processed before sending the
+            // next on the channel?
+            let _ = self.api_event_fd.read();
+            // If multiple pending requests on the channel are possible, should we put this in a
+            // loop, to make sure no requests are left?
             match self.from_api.try_recv() {
                 Ok(api_request) => {
-                    let response = self.controller.handle_request(*api_request);
-                    // Send back the result.
-                    self.to_api
-                        .send(Box::new(response))
-                        .map_err(|_| ())
-                        .expect("one-shot channel closed");
+                    let request_is_pause = *api_request == VmmAction::Pause;
+                    self.handle_request(*api_request);
+
+                    // If the latest req is a pause request, temporarily switch to a mode where we
+                    // do blocking `recv`s on the `from_api` receiver in a loop, until we get
+                    // unpaused. The device emulation is implicitly paused since we do not
+                    // relinquish control to the event manager because we're not returning from
+                    // `process`.
+                    if request_is_pause {
+                        // This loop only attempts to process API requests, so things like the
+                        // metric flush timerfd handling are frozen as well. We can add some logic
+                        // to process that too, by blocking with a timeout and doing other things
+                        // before blocking once more in the loop.
+                        loop {
+                            let req = self.from_api.recv().expect("Error receiving API request.");
+                            let req_is_resume = *req == VmmAction::Resume;
+                            self.handle_request(*req);
+                            if req_is_resume {
+                                break;
+                            }
+                        }
+                    }
                 }
                 Err(TryRecvError::Empty) => {
                     warn!("Got a spurious notification from api thread");
@@ -82,7 +114,6 @@ impl Subscriber for ApiServerAdapter {
                     panic!("The channel's sending half was disconnected. Cannot receive data.");
                 }
             };
-            let _ = self.api_event_fd.read();
         } else {
             error!("Spurious EventManager event for handler: ApiServerAdapter");
         }
