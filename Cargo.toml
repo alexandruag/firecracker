@@ -8,3 +8,6 @@ panic = "abort"
 [profile.release]
 panic = "abort"
 lto = true
+
+[patch.crates-io]
+versionize = { git = "https://github.com/alexandruag/versionize.git", branch = "blob" }

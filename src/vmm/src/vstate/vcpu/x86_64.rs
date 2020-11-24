@@ -17,11 +17,12 @@ use crate::vstate::{
 };
 use cpuid::{c3, filter_cpuid, t2, VmSpec};
 use kvm_bindings::{
-    kvm_debugregs, kvm_lapic_state, kvm_mp_state, kvm_regs, kvm_sregs, kvm_vcpu_events, kvm_xcrs,
-    kvm_xsave, CpuId, MsrList, Msrs,
+    kvm_cpuid2, kvm_debugregs, kvm_lapic_state, kvm_mp_state, kvm_msrs, kvm_regs, kvm_sregs,
+    kvm_vcpu_events, kvm_xcrs, kvm_xsave, CpuId, MsrList, Msrs,
 };
 use kvm_ioctls::{VcpuExit, VcpuFd};
 use logger::{error, IncMetric, METRICS};
+use versionize::blob::{Blob, FamBlob};
 use versionize::{VersionMap, Versionize, VersionizeResult};
 use versionize_derive::Versionize;
 use vm_memory::{Address, GuestAddress, GuestMemoryMmap};
@@ -275,19 +276,19 @@ impl KvmVcpu {
             .map_err(Error::VcpuGetVcpuEvents)?;
 
         Ok(VcpuState {
-            cpuid: self
+            cpuid: FamBlob(self
                 .fd
                 .get_cpuid2(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
-                .map_err(Error::VcpuGetCpuid)?,
-            msrs,
-            debug_regs,
-            lapic,
-            mp_state,
-            regs,
-            sregs,
-            vcpu_events,
-            xcrs,
-            xsave,
+                .map_err(Error::VcpuGetCpuid)?),
+            msrs: FamBlob(msrs),
+            debug_regs: Blob(debug_regs),
+            lapic: Blob(lapic),
+            mp_state: Blob(mp_state),
+            regs: Blob(regs),
+            sregs: Blob(sregs),
+            vcpu_events: Blob(vcpu_events),
+            xcrs: Blob(xcrs),
+            xsave: Blob(xsave),
         })
     }
 
@@ -316,28 +317,28 @@ impl KvmVcpu {
          * only restores successfully, when the LAPIC is correctly configured.
          */
         self.fd
-            .set_cpuid2(&state.cpuid)
+            .set_cpuid2(&state.cpuid.0)
             .map_err(Error::VcpuSetCpuid)?;
         self.fd
-            .set_mp_state(state.mp_state)
+            .set_mp_state(state.mp_state.0)
             .map_err(Error::VcpuSetMpState)?;
-        self.fd.set_regs(&state.regs).map_err(Error::VcpuSetRegs)?;
+        self.fd.set_regs(&state.regs.0).map_err(Error::VcpuSetRegs)?;
         self.fd
-            .set_sregs(&state.sregs)
+            .set_sregs(&state.sregs.0)
             .map_err(Error::VcpuSetSregs)?;
         self.fd
-            .set_xsave(&state.xsave)
+            .set_xsave(&state.xsave.0)
             .map_err(Error::VcpuSetXsave)?;
-        self.fd.set_xcrs(&state.xcrs).map_err(Error::VcpuSetXcrs)?;
+        self.fd.set_xcrs(&state.xcrs.0).map_err(Error::VcpuSetXcrs)?;
         self.fd
-            .set_debug_regs(&state.debug_regs)
+            .set_debug_regs(&state.debug_regs.0)
             .map_err(Error::VcpuSetDebugRegs)?;
         self.fd
-            .set_lapic(&state.lapic)
+            .set_lapic(&state.lapic.0)
             .map_err(Error::VcpuSetLapic)?;
-        self.fd.set_msrs(&state.msrs).map_err(Error::VcpuSetMsrs)?;
+        self.fd.set_msrs(&state.msrs.0).map_err(Error::VcpuSetMsrs)?;
         self.fd
-            .set_vcpu_events(&state.vcpu_events)
+            .set_vcpu_events(&state.vcpu_events.0)
             .map_err(Error::VcpuSetVcpuEvents)?;
         Ok(())
     }
@@ -378,16 +379,16 @@ impl KvmVcpu {
 #[derive(Clone, Versionize)]
 /// Structure holding VCPU kvm state.
 pub struct VcpuState {
-    cpuid: CpuId,
-    msrs: Msrs,
-    debug_regs: kvm_debugregs,
-    lapic: kvm_lapic_state,
-    mp_state: kvm_mp_state,
-    regs: kvm_regs,
-    sregs: kvm_sregs,
-    vcpu_events: kvm_vcpu_events,
-    xcrs: kvm_xcrs,
-    xsave: kvm_xsave,
+    cpuid: FamBlob<kvm_cpuid2>,
+    msrs: FamBlob<kvm_msrs>,
+    debug_regs: Blob<kvm_debugregs>,
+    lapic: Blob<kvm_lapic_state>,
+    mp_state: Blob<kvm_mp_state>,
+    regs: Blob<kvm_regs>,
+    sregs: Blob<kvm_sregs>,
+    vcpu_events: Blob<kvm_vcpu_events>,
+    xcrs: Blob<kvm_xcrs>,
+    xsave: Blob<kvm_xsave>,
 }
 
 #[cfg(test)]
@@ -403,8 +404,8 @@ mod tests {
     impl Default for VcpuState {
         fn default() -> Self {
             VcpuState {
-                cpuid: CpuId::new(1),
-                msrs: Msrs::new(1),
+                cpuid: FamBlob(CpuId::new(1)),
+                msrs: FamBlob(Msrs::new(1)),
                 debug_regs: Default::default(),
                 lapic: Default::default(),
                 mp_state: Default::default(),
