@@ -25,10 +25,8 @@ use vm_memory_upstream::address::Address;
 use vm_memory_upstream::guest_memory::{
     self, FileOffset, GuestAddress, GuestMemory, GuestMemoryRegion, GuestUsize, MemoryRegionAddress,
 };
-use vm_memory_upstream::volatile_memory::{
-    Error as VolatileMemoryError, VolatileMemory, VolatileSlice,
-};
-use vm_memory_upstream::{AtomicAccess, ByteValued, Bytes};
+use vm_memory_upstream::volatile_memory::{VolatileMemory, VolatileSlice};
+use vm_memory_upstream::{AtomicAccess, Bytes};
 
 use vmm_sys_util::errno;
 
@@ -99,11 +97,11 @@ impl GuestRegionMmap {
     }
 
     // This is exclusively used for the local `Bytes` implementation.
-    fn local_volatile_slice(&self) -> VolatileSlice {
-        // It's safe to unwrap because we're starting at offset 0 and specify the exact
-        // length of the mapping.
-        self.mapping.get_slice(0, self.mapping.len()).unwrap()
-    }
+    // fn local_volatile_slice(&self) -> VolatileSlice {
+    //     // It's safe to unwrap because we're starting at offset 0 and specify the exact
+    //     // length of the mapping.
+    //     self.mapping.get_slice(0, self.mapping.len()).unwrap()
+    // }
 
     /// Creates a guarded mapping based on the provided arguments.
     /// Guard pages will be created at the beginning and the end of the range.
@@ -184,63 +182,79 @@ impl Deref for GuestRegionMmap {
 impl Bytes<MemoryRegionAddress> for GuestRegionMmap {
     type E = guest_memory::Error;
 
+    /// # Examples
+    /// * Write a slice at guest address 0x1200.
+    ///
+    /// ```
+    /// # use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+    /// # let start_addr = GuestAddress(0x1000);
+    /// # let mut gm = GuestMemoryMmap::from_ranges(&vec![(start_addr, 0x400)]).unwrap();
+    ///   let res = gm.write(&[1,2,3,4,5], GuestAddress(0x1200)).unwrap();
+    ///   assert_eq!(5, res);
+    /// ```
     fn write(&self, buf: &[u8], addr: MemoryRegionAddress) -> guest_memory::Result<usize> {
         let maddr = addr.raw_value() as usize;
-        let bytes = self
-            .local_volatile_slice()
+        self.as_volatile_slice()
+            .unwrap()
             .write(buf, maddr)
-            .map_err(Into::<guest_memory::Error>::into)?;
-        self.mark_dirty_pages(maddr, bytes);
-        Ok(bytes)
+            .map_err(Into::into)
     }
 
+    /// # Examples
+    /// * Read a slice of length 16 at guestaddress 0x1200.
+    ///
+    /// ```
+    /// # use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+    /// # let start_addr = GuestAddress(0x1000);
+    /// # let mut gm = GuestMemoryMmap::from_ranges(&vec![(start_addr, 0x400)]).unwrap();
+    ///   let buf = &mut [0u8; 16];
+    ///   let res = gm.read(buf, GuestAddress(0x1200)).unwrap();
+    ///   assert_eq!(16, res);
+    /// ```
     fn read(&self, buf: &mut [u8], addr: MemoryRegionAddress) -> guest_memory::Result<usize> {
         let maddr = addr.raw_value() as usize;
-        self.local_volatile_slice()
+        self.as_volatile_slice()
+            .unwrap()
             .read(buf, maddr)
             .map_err(Into::into)
     }
 
     fn write_slice(&self, buf: &[u8], addr: MemoryRegionAddress) -> guest_memory::Result<()> {
         let maddr = addr.raw_value() as usize;
-        match self.local_volatile_slice().write_slice(buf, maddr) {
-            Ok(()) => {
-                self.mark_dirty_pages(maddr, buf.len());
-                Ok(())
-            }
-            Err(e) => {
-                if let VolatileMemoryError::PartialBuffer { completed, .. } = e {
-                    self.mark_dirty_pages(maddr, completed);
-                }
-                Err(e.into())
-            }
-        }
+        self.as_volatile_slice()
+            .unwrap()
+            .write_slice(buf, maddr)
+            .map_err(Into::into)
     }
 
     fn read_slice(&self, buf: &mut [u8], addr: MemoryRegionAddress) -> guest_memory::Result<()> {
         let maddr = addr.raw_value() as usize;
-        self.local_volatile_slice()
+        self.as_volatile_slice()
+            .unwrap()
             .read_slice(buf, maddr)
             .map_err(Into::into)
     }
 
-    // Add explicit implementations for the `*_obj` methods, just in case something changes
-    // with the default logic provided in `Bytes`.
-    fn write_obj<T: ByteValued>(
-        &self,
-        val: T,
-        addr: MemoryRegionAddress,
-    ) -> guest_memory::Result<()> {
-        // Write dispatched to write_slice.
-        self.write_slice(val.as_slice(), addr)
-    }
-
-    fn read_obj<T: ByteValued>(&self, addr: MemoryRegionAddress) -> guest_memory::Result<T> {
-        let mut result: T = Default::default();
-        // Read dispatched to `read_slice`.
-        self.read_slice(result.as_mut_slice(), addr).map(|_| result)
-    }
-
+    /// # Examples
+    ///
+    /// * Read bytes from /dev/urandom
+    ///
+    /// ```
+    /// # use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryMmap};
+    /// # use std::fs::File;
+    /// # use std::path::Path;
+    /// # let start_addr = GuestAddress(0x1000);
+    /// # let gm = GuestMemoryMmap::from_ranges(&vec![(start_addr, 0x400)]).unwrap();
+    ///   let mut file = if cfg!(unix) {
+    ///       File::open(Path::new("/dev/urandom")).unwrap()
+    ///   } else {
+    ///       File::open(Path::new("c:\\Windows\\system32\\ntoskrnl.exe")).unwrap()
+    ///   };
+    ///   let addr = GuestAddress(0x1010);
+    ///   gm.read_from(addr, &mut file, 128).unwrap();
+    ///   let read_addr = addr.checked_add(8).unwrap();
+    ///   let _: u32 = gm.read_obj(read_addr).unwrap();
+    /// ```
     fn read_from<F>(
         &self,
         addr: MemoryRegionAddress,
@@ -251,14 +265,32 @@ impl Bytes<MemoryRegionAddress> for GuestRegionMmap {
         F: Read,
     {
         let maddr = addr.raw_value() as usize;
-        let bytes = self
-            .local_volatile_slice()
+        self.as_volatile_slice()
+            .unwrap()
             .read_from::<F>(maddr, src, count)
-            .map_err(Into::<guest_memory::Error>::into)?;
-        self.mark_dirty_pages(maddr, bytes);
-        Ok(bytes)
+            .map_err(Into::into)
     }
 
+    /// # Examples
+    ///
+    /// * Read bytes from /dev/urandom
+    ///
+    /// ```
+    /// # use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryMmap};
+    /// # use std::fs::File;
+    /// # use std::path::Path;
+    /// # let start_addr = GuestAddress(0x1000);
+    /// # let gm = GuestMemoryMmap::from_ranges(&vec![(start_addr, 0x400)]).unwrap();
+    ///   let mut file = if cfg!(unix) {
+    ///       File::open(Path::new("/dev/urandom")).unwrap()
+    ///   } else {
+    ///       File::open(Path::new("c:\\Windows\\system32\\ntoskrnl.exe")).unwrap()
+    ///   };
+    ///   let addr = GuestAddress(0x1010);
+    ///   gm.read_exact_from(addr, &mut file, 128).unwrap();
+    ///   let read_addr = addr.checked_add(8).unwrap();
+    ///   let _: u32 = gm.read_obj(read_addr).unwrap();
+    /// ```
     fn read_exact_from<F>(
         &self,
         addr: MemoryRegionAddress,
@@ -269,13 +301,29 @@ impl Bytes<MemoryRegionAddress> for GuestRegionMmap {
         F: Read,
     {
         let maddr = addr.raw_value() as usize;
-        self.local_volatile_slice()
+        self.as_volatile_slice()
+            .unwrap()
             .read_exact_from::<F>(maddr, src, count)
-            .map_err(Into::<guest_memory::Error>::into)?;
-        self.mark_dirty_pages(maddr, count);
-        Ok(())
+            .map_err(Into::into)
     }
 
+    /// Writes data from the region to a writable object.
+    ///
+    /// # Examples
+    ///
+    /// * Write 128 bytes to a temp file
+    ///
+    /// ```
+    /// # extern crate vmm_sys_util;
+    /// # use vmm_sys_util::tempfile::TempFile;
+    /// # use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryMmap};
+    /// # use std::fs::OpenOptions;
+    /// # let start_addr = GuestAddress(0x1000);
+    /// # let gm = GuestMemoryMmap::from_ranges(&vec![(start_addr, 0x400)]).unwrap();
+    ///   let mut file = TempFile::new().unwrap().into_file();
+    ///   let mut mem = [0u8; 1024];
+    ///   gm.write_to(start_addr, &mut file, 128).unwrap();
+    /// ```
     fn write_to<F>(
         &self,
         addr: MemoryRegionAddress,
@@ -286,11 +334,29 @@ impl Bytes<MemoryRegionAddress> for GuestRegionMmap {
         F: Write,
     {
         let maddr = addr.raw_value() as usize;
-        self.local_volatile_slice()
+        self.as_volatile_slice()
+            .unwrap()
             .write_to::<F>(maddr, dst, count)
             .map_err(Into::into)
     }
 
+    /// Writes data from the region to a writable object.
+    ///
+    /// # Examples
+    ///
+    /// * Write 128 bytes to a temp file
+    ///
+    /// ```
+    /// # extern crate vmm_sys_util;
+    /// # use vmm_sys_util::tempfile::TempFile;
+    /// # use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryMmap};
+    /// # use std::fs::OpenOptions;
+    /// # let start_addr = GuestAddress(0x1000);
+    /// # let gm = GuestMemoryMmap::from_ranges(&vec![(start_addr, 0x400)]).unwrap();
+    ///   let mut file = TempFile::new().unwrap().into_file();
+    ///   let mut mem = [0u8; 1024];
+    ///   gm.write_all_to(start_addr, &mut file, 128).unwrap();
+    /// ```
     fn write_all_to<F>(
         &self,
         addr: MemoryRegionAddress,
@@ -301,28 +367,31 @@ impl Bytes<MemoryRegionAddress> for GuestRegionMmap {
         F: Write,
     {
         let maddr = addr.raw_value() as usize;
-        self.local_volatile_slice()
+        self.as_volatile_slice()
+            .unwrap()
             .write_all_to::<F>(maddr, dst, count)
             .map_err(Into::into)
     }
 
     fn store<T: AtomicAccess>(
         &self,
-        _val: T,
-        _addr: MemoryRegionAddress,
-        _order: Ordering,
+        val: T,
+        addr: MemoryRegionAddress,
+        order: Ordering,
     ) -> guest_memory::Result<()> {
-        // We do not use this.
-        Err(guest_memory::Error::HostAddressNotAvailable)
+        self.as_volatile_slice().and_then(|s| {
+            s.store(val, addr.raw_value() as usize, order)
+                .map_err(Into::into)
+        })
     }
 
     fn load<T: AtomicAccess>(
         &self,
-        _addr: MemoryRegionAddress,
-        _order: Ordering,
+        addr: MemoryRegionAddress,
+        order: Ordering,
     ) -> guest_memory::Result<T> {
-        // We do not use this.
-        Err(guest_memory::Error::HostAddressNotAvailable)
+        self.as_volatile_slice()
+            .and_then(|s| s.load(addr.raw_value() as usize, order).map_err(Into::into))
     }
 }
 
@@ -379,11 +448,6 @@ impl GuestMemoryRegion for GuestRegionMmap {
     ) -> guest_memory::Result<VolatileSlice> {
         let slice = self.mapping.get_slice(offset.raw_value() as usize, count)?;
         Ok(slice)
-    }
-
-    fn as_volatile_slice(&self) -> guest_memory::Result<VolatileSlice> {
-        // We do not use this.
-        Err(guest_memory::Error::HostAddressNotAvailable)
     }
 }
 

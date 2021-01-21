@@ -153,15 +153,15 @@ impl<'a> DescriptorChain<'a> {
         })
     }
 
-    fn checked_new(
-        mem: &'a GuestMemoryMmap,
-        desc_table: GuestAddress,
-        queue_size: u16,
-        index: u16,
-    ) -> Option<DescriptorChain> {
-        let mut chain = Chain::new(mem, desc_table, queue_size, index);
-        Self::asdf(chain)
-    }
+    // fn checked_new(
+    //     mem: &'a GuestMemoryMmap,
+    //     desc_table: GuestAddress,
+    //     queue_size: u16,
+    //     index: u16,
+    // ) -> Option<DescriptorChain> {
+    //     let chain = Chain::new(mem, desc_table, queue_size, index);
+    //     Self::asdf(chain)
+    // }
 
     /// Gets if this descriptor chain has another descriptor chain linked after it.
     pub fn has_next(&self) -> bool {
@@ -296,7 +296,6 @@ pub(crate) mod tests {
         // or when avail_idx - next_avail > max_size
         q.next_avail = Wrapping(5);
         // assert!(!q.is_valid(m));
-
 
         // avail_ring + 2 is the address of avail_idx in guest mem
         m.write_obj::<u16>(64 as u16, q.avail_ring.unchecked_add(2))
