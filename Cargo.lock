@@ -827,7 +827,7 @@ dependencies = [
 [[package]]
 name = "vm-virtio"
 version = "0.1.0"
-source = "git+https://github.com/alexandruag/vm-virtio.git?branch=config3#6ec03bec405ba43de66e77b5be9ec5366fe92f54"
+source = "git+https://github.com/alexandruag/vm-virtio.git?branch=config4#ff7729e747295bc769ca1f75dbb344c5ae1150c4"
 dependencies = [
  "byteorder",
  "libc",

@@ -16,7 +16,6 @@ mod mmio;
 pub mod net;
 pub mod persist;
 mod queue;
-mod queue2;
 pub mod test_utils;
 pub mod vsock;
 

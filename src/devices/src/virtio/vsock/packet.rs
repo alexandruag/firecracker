@@ -124,7 +124,7 @@ impl VsockPacket {
         }
 
         let mut pkt = Self {
-            hdr: get_host_address(head.mem, head.addr, VSOCK_PKT_HDR_SIZE)
+            hdr: get_host_address(head.mem(), head.addr, VSOCK_PKT_HDR_SIZE)
                 .map_err(VsockError::GuestMemoryMmap)?,
             buf: None,
             buf_size: 0,
@@ -157,7 +157,7 @@ impl VsockPacket {
 
         pkt.buf_size = buf_desc.len as usize;
         pkt.buf = Some(
-            get_host_address(buf_desc.mem, buf_desc.addr, pkt.buf_size)
+            get_host_address(buf_desc.mem(), buf_desc.addr, pkt.buf_size)
                 .map_err(VsockError::GuestMemoryMmap)?,
         );
 
@@ -188,10 +188,10 @@ impl VsockPacket {
         let buf_size = buf_desc.len as usize;
 
         Ok(Self {
-            hdr: get_host_address(head.mem, head.addr, VSOCK_PKT_HDR_SIZE)
+            hdr: get_host_address(head.mem(), head.addr, VSOCK_PKT_HDR_SIZE)
                 .map_err(VsockError::GuestMemoryMmap)?,
             buf: Some(
-                get_host_address(buf_desc.mem, buf_desc.addr, buf_size)
+                get_host_address(buf_desc.mem(), buf_desc.addr, buf_size)
                     .map_err(VsockError::GuestMemoryMmap)?,
             ),
             buf_size,

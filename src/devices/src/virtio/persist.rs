@@ -67,7 +67,7 @@ impl Persist<'_> for Queue {
         _: Self::ConstructorArgs,
         state: &Self::State,
     ) -> std::result::Result<Self, Self::Error> {
-        Ok(Queue {
+        let cfg = vm_virtio::QueueConfig {
             max_size: state.max_size,
             size: state.size,
             ready: state.ready,
@@ -76,7 +76,10 @@ impl Persist<'_> for Queue {
             used_ring: GuestAddress::new(state.used_ring),
             next_avail: state.next_avail,
             next_used: state.next_used,
-        })
+            ..Default::default()
+        };
+
+        Ok(Queue { cfg })
     }
 }
 
