@@ -116,6 +116,18 @@ impl Queue {
             .add_used(desc_index, len)
             .map_err(|_| QueueError::DescIndexOutOfBounds(0))
     }
+
+    pub fn needs_notification(&mut self, mem: &GuestMemoryMmap) -> bool {
+        self.q_mut(mem).needs_notification()
+    }
+
+    pub fn enable_notification(&mut self, mem: &GuestMemoryMmap) -> bool {
+        self.q_mut(mem).enable_notification()
+    }
+
+    pub fn disable_notification(&mut self, mem: &GuestMemoryMmap) {
+        self.q_mut(mem).disable_notification()
+    }
 }
 
 pub struct DescriptorChain<'a> {
