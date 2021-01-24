@@ -94,8 +94,21 @@ impl Queue {
 
     /// Pop the first available descriptor chain from the avail ring.
     pub fn pop<'a, 'b: 'a>(&'a mut self, mem: &'b GuestMemoryMmap) -> Option<DescriptorChain<'b>> {
-        let bla = Q::with_cfg(mem, &mut self.cfg).pop_descriptor_chain()?;
-        DescriptorChain::asdf(bla)
+        // println!("pop called");
+        loop {
+            // println!("pop loop");
+            if let Some(bla) = Q::with_cfg(mem, &mut self.cfg).pop_descriptor_chain() {
+                return DescriptorChain::asdf(bla);
+            }
+
+            if self.enable_notification(mem) {
+                // println!("notification enabled1");
+                self.disable_notification(mem);
+            } else {
+                // println!("notification enabled2");
+                return None;
+            }
+        }
     }
 
     /// Undo the effects of the last `self.pop()` call.

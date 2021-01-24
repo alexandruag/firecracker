@@ -162,9 +162,13 @@ impl Block {
     ) -> io::Result<Block> {
         let disk_properties = DiskProperties::new(disk_image_path, is_disk_read_only)?;
 
-        // Last one is VIRTIO_F_IN_ORDER.
-        let mut avail_features =
-            (1u64 << VIRTIO_F_VERSION_1) | (1u64 << VIRTIO_BLK_F_FLUSH) | (1u64 << 35);
+        // Last ones is VIRTIO_F_IN_ORDER.
+        let mut avail_features = (1u64 << VIRTIO_F_VERSION_1)
+            | (1u64 << VIRTIO_BLK_F_FLUSH)
+            // EVENT_IDX
+            | (1u64 << 29)
+            // VIRTIO_F_IN_ORDER
+            | (1u64 << 35);
 
         if is_disk_read_only {
             avail_features |= 1u64 << VIRTIO_BLK_F_RO;
@@ -227,6 +231,10 @@ impl Block {
             DeviceState::Inactive => unreachable!(),
         };
         let queue = &mut self.queues[queue_index];
+
+        // ?!?!?!
+        queue.event_idx_enabled = true;
+
         let mut used_any = false;
         while let Some(head) = queue.pop(mem) {
             let len;

@@ -158,6 +158,8 @@ impl Net {
             | 1 << VIRTIO_NET_F_HOST_TSO4
             | 1 << VIRTIO_NET_F_HOST_UFO
             | 1 << VIRTIO_F_VERSION_1
+            // EVENT_IDX
+            | 1 << 29
             // VIRTIO_F_IN_ORDER
             | 1 << 35;
 
@@ -291,6 +293,9 @@ impl Net {
         };
 
         let queue = &mut self.queues[RX_INDEX];
+
+        // ?!?!?!!?!
+        queue.event_idx_enabled = true;
         let head_descriptor = queue.pop(mem).ok_or_else(|| {
             METRICS.net.no_rx_avail_buffer.inc();
             FrontendError::EmptyQueue
@@ -477,7 +482,16 @@ impl Net {
 
         // At this point we processed as many Rx frames as possible.
         // We have to wake the guest if at least one descriptor chain has been used.
-        self.signal_rx_used_queue()
+
+        let mem = match self.device_state {
+            DeviceState::Activated(ref mem) => mem,
+            // This should never happen, it's been already validated in the event handler.
+            DeviceState::Inactive => unreachable!(),
+        };
+        if self.queues[RX_INDEX].needs_notification(mem) {
+            return self.signal_rx_used_queue();
+        }
+        Ok(())
     }
 
     // Process the deferred frame first, then continue reading from tap.
@@ -489,7 +503,15 @@ impl Net {
             return self.process_rx();
         }
 
-        self.signal_rx_used_queue()
+        let mem = match self.device_state {
+            DeviceState::Activated(ref mem) => mem,
+            // This should never happen, it's been already validated in the event handler.
+            DeviceState::Inactive => unreachable!(),
+        };
+        if self.queues[RX_INDEX].needs_notification(mem) {
+            return self.signal_rx_used_queue();
+        }
+        Ok(())
     }
 
     fn resume_rx(&mut self) -> result::Result<(), DeviceError> {
@@ -514,6 +536,9 @@ impl Net {
         let mut process_rx_for_mmds = false;
         let mut raise_irq = false;
         let tx_queue = &mut self.queues[TX_INDEX];
+
+        // ?!?!?!
+        tx_queue.event_idx_enabled = true;
 
         while let Some(head) = tx_queue.pop(mem) {
             // If limiter.consume() fails it means there is no more TokenType::Ops
@@ -605,7 +630,9 @@ impl Net {
         }
 
         if raise_irq {
-            self.signal_used_queue()?;
+            if self.queues[TX_INDEX].needs_notification(mem) {
+                self.signal_used_queue()?;
+            }
         } else {
             METRICS.net.no_tx_avail_buffer.inc();
         }
@@ -637,6 +664,13 @@ impl Net {
 
     pub fn process_rx_queue_event(&mut self) {
         METRICS.net.rx_queue_event_count.inc();
+
+        let mem = match self.device_state {
+            DeviceState::Activated(ref mem) => mem,
+            // This should never happen, it's been already validated in the event handler.
+            DeviceState::Inactive => unreachable!(),
+        };
+        self.queues[RX_INDEX].disable_notification(mem);
 
         if let Err(e) = self.queue_evts[RX_INDEX].read() {
             // rate limiters present but with _very high_ allowed rate
@@ -687,6 +721,13 @@ impl Net {
     }
 
     pub fn process_tx_queue_event(&mut self) {
+        let mem = match self.device_state {
+            DeviceState::Activated(ref mem) => mem,
+            // This should never happen, it's been already validated in the event handler.
+            DeviceState::Inactive => unreachable!(),
+        };
+        self.queues[TX_INDEX].disable_notification(mem);
+
         METRICS.net.tx_queue_event_count.inc();
         if let Err(e) = self.queue_evts[TX_INDEX].read() {
             error!("Failed to get tx queue event: {:?}", e);
